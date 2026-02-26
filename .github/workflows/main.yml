@@ -14,11 +14,12 @@ jobs:
       -
         name: Checkout
         uses: actions/checkout@v6
-      - 
-        name: Install Nix
-        uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-25.11
+      -
+        name: Install protoc
+        run: |
+          curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip -o protoc.zip
+          sudo unzip protoc.zip -d /usr/local
+          rm protoc.zip
       -
         name: Cargo cache
         uses: actions/cache@v5
@@ -29,89 +30,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-      -
-        name: Install dev dependencies
-        run: nix-shell --command "make dev-dependencies"
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       -
         name: Run tests
-        run: nix-shell --command "make test"
-
-  dist:
-    needs: tests
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v6
-      - 
-        name: Install Nix
-        uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-25.11
-      -
-        name: Cargo cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-dist-${{ hashFiles('**/Cargo.lock') }}
-      -
-        name: Install dev dependencies
-        run: nix-shell --command "make dev-dependencies"
-      -
-        name: Build distributables
-        run: nix-shell --command "make dist"
-      -
-        name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: eu-west-1
-      -
-        name: Upload binaries to S3
-        run: |
-          aws s3 sync dist s3://builds.loraserver.io/chirpstack-packet-multiplexer
-        if: startsWith(github.ref, 'refs/tags/v')
-      -
-        name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            chirpstack/${{ github.event.repository.name }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}
-            type=semver,pattern={{major}}.{{minor}}
-      -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      -
-        name: Login to DockerHub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      -
-        name: Build and push
-        id: docker_build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          platforms: linux/amd64,linux/arm/v7,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-      -
-        name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+        run: cargo test

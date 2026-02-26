@@ -1,6 +1,7 @@
 # hidden files
 .*
 !/.github
+!/.dockerignore
 
 # dependencies
 /target
@@ -9,4 +10,4 @@
 /dist
 
 # config
-/chirpstack-packet-multiplexer.toml
+/config.toml

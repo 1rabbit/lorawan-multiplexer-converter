@@ -20,6 +20,10 @@ static GATEWAY_UDP_RECEIVED_COUNT: OnceCell<Family<GatewayUdpLabels, Counter>> =
 static SERVER_UDP_SENT_COUNT: OnceCell<Family<ServerUdpLabels, Counter>> = OnceCell::const_new();
 static SERVER_UDP_RECEIVED_COUNT: OnceCell<Family<ServerUdpLabels, Counter>> =
     OnceCell::const_new();
+static MQTT_MESSAGES_PUBLISHED: OnceCell<Family<MqttLabels, Counter>> = OnceCell::const_new();
+static MQTT_MESSAGES_RECEIVED: OnceCell<Family<MqttLabels, Counter>> = OnceCell::const_new();
+static MQTT_CONNECTED: OnceCell<Family<MqttConnectedLabels, prometheus_client::metrics::gauge::Gauge>>
+    = OnceCell::const_new();
 
 #[derive(Clone, Hash, PartialEq, Eq, EncodeLabelSet, Debug)]
 struct GatewayUdpLabels {
@@ -31,6 +35,17 @@ struct GatewayUdpLabels {
 struct ServerUdpLabels {
     server: String,
     r#type: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, EncodeLabelSet, Debug)]
+struct MqttLabels {
+    server: String,
+    r#type: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, EncodeLabelSet, Debug)]
+struct MqttConnectedLabels {
+    server: String,
 }
 
 pub async fn setup(bind: &str) -> Result<()> {
@@ -159,4 +174,70 @@ pub async fn inc_server_udp_received_count(server: &str, packet_type: PacketType
             r#type: packet_type.to_string(),
         })
         .inc();
+}
+
+pub async fn inc_mqtt_messages_published(server: &str, msg_type: &str) {
+    let counter = MQTT_MESSAGES_PUBLISHED
+        .get_or_init(|| async {
+            let counter = Family::<MqttLabels, Counter>::default();
+            register(
+                "mqtt_messages_published_total",
+                "Number of MQTT messages published",
+                counter.clone(),
+            )
+            .await;
+            counter
+        })
+        .await;
+
+    counter
+        .get_or_create(&MqttLabels {
+            server: server.to_string(),
+            r#type: msg_type.to_string(),
+        })
+        .inc();
+}
+
+pub async fn inc_mqtt_messages_received(server: &str, msg_type: &str) {
+    let counter = MQTT_MESSAGES_RECEIVED
+        .get_or_init(|| async {
+            let counter = Family::<MqttLabels, Counter>::default();
+            register(
+                "mqtt_messages_received_total",
+                "Number of MQTT messages received",
+                counter.clone(),
+            )
+            .await;
+            counter
+        })
+        .await;
+
+    counter
+        .get_or_create(&MqttLabels {
+            server: server.to_string(),
+            r#type: msg_type.to_string(),
+        })
+        .inc();
+}
+
+pub async fn inc_mqtt_connected(server: &str, connected: bool) {
+    let gauge = MQTT_CONNECTED
+        .get_or_init(|| async {
+            let gauge =
+                Family::<MqttConnectedLabels, prometheus_client::metrics::gauge::Gauge>::default();
+            register(
+                "mqtt_connected",
+                "MQTT connection status (1=connected, 0=disconnected)",
+                gauge.clone(),
+            )
+            .await;
+            gauge
+        })
+        .await;
+
+    gauge
+        .get_or_create(&MqttConnectedLabels {
+            server: server.to_string(),
+        })
+        .set(if connected { 1 } else { 0 });
 }

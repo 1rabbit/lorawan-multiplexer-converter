@@ -1,11 +1,11 @@
 [package]
-  name = "chirpstack-packet-multiplexer"
-  description = "ChirpStack Packet Multiplexer"
-  repository = "https://github.com/chirpstack/chirpstack-package-multiplexer/"
-  homepage = "https://github.com/chirpstack/chirpstack-package-multiplexer/"
+  name = "lorawan-multiplexer-converter"
+  description = "LoRaWAN Multiplexer Converter"
+  repository = "https://github.com/1rabbit/lorawan-multiplexer-converter/"
+  homepage = "https://github.com/1rabbit/lorawan-multiplexer-converter/"
   license = "MIT"
   version = "4.0.0"
-  authors = ["Orne Brocaar <info@brocaar.com>"]
+  authors = ["1rabbit"]
   edition = "2024"
   publish = false
 
@@ -33,30 +33,44 @@
     "time",
   ] }
   anyhow = "1.0"
-  lrwn_filters = { version = "4.15.0", features = ["serde"] }
+  lrwn_filters = { version = "4.16.0", features = ["serde"] }
   tracing = "0.1"
   tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
   signal-hook = "0.4"
   hex = "0.4"
-  axum = "0.8"
+  axum = { version = "0.8", features = ["ws"] }
+  tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+  futures-util = "0.3"
   handlebars = "6.3"
+  rumqttc = { version = "0.24", features = ["url", "websocket"] }
+  chirpstack_api = { version = "4.15", features = ["json"] }
+  rustls = { version = "0.22", default-features = false, features = ["tls12"] }
+  rustls_v023 = { package = "rustls", version = "0.23", default-features = false, features = ["ring", "tls12"] }
+  webpki-roots = "1"
+  rustls-native-certs = "0.8"
+  rustls-pemfile = "2.2"
+  humantime-serde = "1.1"
+  rand = "0.8"
+  url = "2.5"
+  prost = "0.14"
+  chrono = "0.4"
 
   # Debian packaging.
   [package.metadata.deb]
     assets = [
       [
-        "target/release/chirpstack-packet-multiplexer",
+        "target/release/lorawan-multiplexer-converter",
         "usr/bin/",
         "755",
       ],
       [
-        "packaging/debian/chirpstack-packet-multiplexer.toml",
-        "etc/chirpstack-packet-multiplexer/",
+        "packaging/debian/lorawan-multiplexer-converter.toml",
+        "etc/lorawan-multiplexer-converter/",
         "640",
       ],
     ]
     conf-files = [
-      "/etc/chirpstack-packet-multiplexer/chirpstack-packet-multiplexer.toml",
+      "/etc/lorawan-multiplexer-converter/lorawan-multiplexer-converter.toml",
     ]
     maintainer-scripts = "packaging/debian/"
     systemd-units = { enable = true }

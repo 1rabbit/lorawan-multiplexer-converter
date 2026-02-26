@@ -1,0 +1,23 @@
+# Build artifacts (cargo build runs inside Docker)
+target/
+
+# Git
+.git/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local config (contains credentials)
+config.toml
+
+# Claude
+.claude/
+claude.md
+
+# Misc
+.DS_Store
+Thumbs.db
+dist/

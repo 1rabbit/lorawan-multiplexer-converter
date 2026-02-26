@@ -3,7 +3,7 @@ use std::str::FromStr;
 use tokio::net::UdpSocket;
 use tracing_subscriber::prelude::*;
 
-use chirpstack_packet_multiplexer::{config, forwarder, listener};
+use lorawan_multiplexer_converter::{config, forwarder, listener};
 
 #[tokio::test]
 async fn test() {
@@ -12,9 +12,12 @@ async fn test() {
         .init();
 
     let conf = config::Configuration {
-        multiplexer: config::Multiplexer {
-            bind: "0.0.0.0:1710".into(),
-            servers: vec![config::Server {
+        gwmp: config::Gwmp {
+            inputs: vec![config::GwmpInput {
+                bind: "0.0.0.0:1710".into(),
+                ..Default::default()
+            }],
+            outputs: vec![config::GwmpOutput {
                 server: "localhost:1711".into(),
                 filters: config::Filters {
                     dev_addr_prefixes: vec![
@@ -28,8 +31,8 @@ async fn test() {
         ..Default::default()
     };
 
-    let (downlink_tx, uplink_rx) = listener::setup(&conf.multiplexer.bind).await.unwrap();
-    forwarder::setup(downlink_tx, uplink_rx, conf.multiplexer.servers.clone())
+    let (downlink_tx, uplink_rx, _uplink_tx) = listener::setup(&conf.gwmp.inputs).await.unwrap();
+    forwarder::setup(downlink_tx, uplink_rx, conf.gwmp.outputs.clone())
         .await
         .unwrap();
     let mut buffer: [u8; 65535] = [0; 65535];

@@ -1,0 +1,345 @@
+# Logging settings.
+#
+# These settings are optional. If not provided, the defaults are used.
+[logging]
+
+  # Log level.
+  #
+  # Valid options are:
+  #   * TRACE
+  #   * DEBUG
+  #   * INFO
+  #   * WARN
+  #   * ERROR
+  #
+  # Default: "info"
+  level="info"
+
+
+# GWMP configuration.
+[gwmp]
+
+  # UDP inputs.
+  #
+  # Each input binds to an interface:port and tags incoming packets with
+  # a topic_prefix (region). Multiple inputs can be configured for
+  # different regions.
+  #
+  # Example:
+  # [[gwmp.input]]
+  #   bind="0.0.0.0:1700"
+  #   topic_prefix="eu868"
+
+  # Outputs to forward gateway data to.
+  #
+  # Example configuration:
+  # [[gwmp.output]]
+  #
+  #   # Hostname:port of the server.
+  #   server="example.com:1700"
+  #
+  #   # Only allow uplink.
+  #   #
+  #   # If set to true, any downlink will be discarded.
+  #   uplink_only=false
+  #
+  #   # Gateway ID prefix filters (allow list).
+  #   #
+  #   # If not set, data of all gateways will be forwarded. If set, only data
+  #   # from gateways with a matching Gateway ID will be forwarded.
+  #   #
+  #   # Example:
+  #   # * "0102030405060708/64": Exact match (all 64 bits of the filter must match)
+  #   # * "0102030400000000/32": All gateway IDs starting with "01020304" (filter on 32 most significant bits)
+  #   gateway_id_prefixes=[]
+  #
+  #   # Gateway ID deny list.
+  #   #
+  #   # If set, gateways matching any prefix will be rejected.
+  #   # Deny takes precedence over allow.
+  #   gateway_id_deny=[]
+  #
+  #   # Filter configuration.
+  #   [gwmp.output.filters]
+  #
+  #     # DevAddr prefix filters (allow list).
+  #     #
+  #     # Example configuration:
+  #     # dev_addr_prefixes=["0000ff00/24"]
+  #     #
+  #     # The above filter means that the 24MSB of 0000ff00 will be used to
+  #     # filter DevAddrs. Uplinks with DevAddrs that do not match any of the
+  #     # configured filters will not be forwarded. Leaving this option empty
+  #     # disables filtering on DevAddr.
+  #     dev_addr_prefixes=[]
+  #
+  #     # DevAddr deny list.
+  #     #
+  #     # If set, uplinks with DevAddrs matching any prefix will be rejected.
+  #     # Deny takes precedence over allow.
+  #     dev_addr_deny=[]
+  #
+  #     # JoinEUI prefix filters (allow list).
+  #     #
+  #     # Example configuration:
+  #     # join_eui_prefixes=["0000ff0000000000/24"]
+  #     #
+  #     # The above filter means that the 24MSB of 0000ff0000000000 will be used
+  #     # to filter JoinEUIs. Uplinks with JoinEUIs that do not match any of the
+  #     # configured filters will not be forwarded. Leaving this option empty
+  #     # disables filtering on JoinEUI.
+  #     join_eui_prefixes=[]
+  #
+  #     # JoinEUI deny list.
+  #     #
+  #     # If set, join requests with JoinEUIs matching any prefix will be rejected.
+  #     # Deny takes precedence over allow.
+  #     join_eui_deny=[]
+
+
+# MQTT backend configuration.
+[mqtt]
+
+  # MQTT inputs (subscribe to uplinks from an MQTT broker).
+  #
+  # Example configuration:
+  # [[mqtt.input]]
+  #   # MQTT broker server address.
+  #   server="tcp://localhost:1883"
+  #
+  #   # Use JSON encoding instead of Protobuf.
+  #   json=false
+  #
+  #   # MQTT credentials.
+  #   username=""
+  #   password=""
+  #
+  #   # MQTT QoS level (0, 1, or 2).
+  #   qos=0
+  #
+  #   # Clean session flag.
+  #   clean_session=true
+  #
+  #   # Client ID (auto-generated if empty).
+  #   client_id=""
+  #
+  #   # Keep alive interval.
+  #   keep_alive_interval="30s"
+  #
+  #   # Reconnect interval after connection loss.
+  #   reconnect_interval="1s"
+  #
+  #   # TLS certificate and key (optional, for TLS connections).
+  #   # ca_cert=""
+  #   # tls_cert=""
+  #   # tls_key=""
+  #
+  #   # Gateway ID prefix filters (allow list).
+  #   # gateway_id_prefixes=[]
+  #
+  #   # Gateway ID deny list.
+  #   # Deny takes precedence over allow.
+  #   # gateway_id_deny=[]
+  #
+  #   # Filter configuration.
+  #   [mqtt.input.filters]
+  #     dev_addr_prefixes=[]
+  #     dev_addr_deny=[]
+  #     join_eui_prefixes=[]
+  #     join_eui_deny=[]
+
+  # MQTT outputs (publish uplinks to an MQTT broker, subscribe to downlinks).
+  #
+  # Example configuration:
+  # [[mqtt.output]]
+  #   # MQTT broker server address.
+  #   server="tcp://localhost:1883"
+  #
+  #   # Use JSON encoding instead of Protobuf.
+  #   json=false
+  #
+  #   # MQTT credentials.
+  #   username=""
+  #   password=""
+  #
+  #   # MQTT QoS level (0, 1, or 2).
+  #   qos=0
+  #
+  #   # Clean session flag.
+  #   clean_session=true
+  #
+  #   # Client ID (auto-generated if empty).
+  #   client_id=""
+  #
+  #   # Keep alive interval.
+  #   keep_alive_interval="30s"
+  #
+  #   # Reconnect interval after connection loss.
+  #   reconnect_interval="1s"
+  #
+  #   # TLS certificate and key (optional, for TLS connections).
+  #   # ca_cert=""
+  #   # tls_cert=""
+  #   # tls_key=""
+  #
+  #   # Only allow uplink (discard downlinks from broker).
+  #   uplink_only=false
+  #
+  #   # Analyzer mode (forward all traffic for analysis).
+  #   analyzer=false
+  #
+  #   # Forward application-layer messages.
+  #   forward_application=false
+  #
+  #   # Gateway ID prefix filters (allow list).
+  #   # gateway_id_prefixes=[]
+  #
+  #   # Gateway ID deny list.
+  #   # Deny takes precedence over allow.
+  #   # gateway_id_deny=[]
+  #
+  #   # Filter configuration.
+  #   [mqtt.output.filters]
+  #     dev_addr_prefixes=[]
+  #     dev_addr_deny=[]
+  #     join_eui_prefixes=[]
+  #     join_eui_deny=[]
+
+
+# Basic Station (WebSocket) configuration.
+[basics]
+
+  # Basic Station Input - Accept connections from BS-speaking gateways.
+  #
+  # Gateways connect via WebSocket to ws://host:port/gateway/{gateway_id}.
+  # The gateway sends a "version" message, receives "router_config", then
+  # exchanges updf/jreq (uplinks) and dnmsg (downlinks).
+  #
+  # Example configuration:
+  # [[basics.input]]
+  #   # Interface:port to bind the WebSocket server to.
+  #   bind = "0.0.0.0:3001"
+  #
+  #   # Region / topic prefix (same role as gwmp.input.topic_prefix).
+  #   topic_prefix = "eu868"
+  #
+  #   # WebSocket ping interval.
+  #   ping_interval = "30s"
+  #
+  #   # Read timeout (disconnect gateway if no message received within this period).
+  #   read_timeout = "90s"
+  #
+  #   # Write timeout.
+  #   write_timeout = "10s"
+  #
+  #   # TLS certificate and key (optional, for wss:// connections).
+  #   # tls_cert = ""
+  #   # tls_key = ""
+  #   # ca_cert = ""
+  #
+  #   # Gateway ID prefix filters (allow list).
+  #   # gateway_id_prefixes = []
+  #
+  #   # Gateway ID deny list.
+  #   # gateway_id_deny = []
+  #
+  #   # Router config sent to connecting gateways.
+  #   [basics.input.router_config]
+  #     # Network IDs to accept.
+  #     net_ids = [0]
+  #
+  #     # JoinEUI ranges to accept ([begin, end] pairs).
+  #     join_euis = [[0, 18446744073709551615]]
+  #
+  #     # Frequency range in Hz [min, max].
+  #     freq_range = [863000000, 870000000]
+  #
+  #     # Data rate table (16 entries): [SF, BW_kHz, dnonly].
+  #     # SF=-1 means unused. SF=0,BW=0 means FSK.
+  #     drs = [
+  #       [12, 125, 0],  # DR0: SF12/BW125
+  #       [11, 125, 0],  # DR1: SF11/BW125
+  #       [10, 125, 0],  # DR2: SF10/BW125
+  #       [9,  125, 0],  # DR3: SF9/BW125
+  #       [8,  125, 0],  # DR4: SF8/BW125
+  #       [7,  125, 0],  # DR5: SF7/BW125
+  #       [7,  250, 0],  # DR6: SF7/BW250
+  #       [0,  0,   0],  # DR7: FSK
+  #       [-1, 0, 0], [-1, 0, 0], [-1, 0, 0], [-1, 0, 0],
+  #       [-1, 0, 0], [-1, 0, 0], [-1, 0, 0], [-1, 0, 0],
+  #     ]
+  #
+  #   # Filter configuration.
+  #   # [basics.input.filters]
+  #   #   dev_addr_prefixes = []
+  #   #   dev_addr_deny = []
+  #   #   join_eui_prefixes = []
+  #   #   join_eui_deny = []
+
+  # Basic Station Output - Forward uplinks to a BS-speaking LNS.
+  #
+  # Connects as a WebSocket client to the remote LNS, sends a "version"
+  # message, receives "router_config", then forwards updf/jreq and
+  # receives dnmsg (downlinks).
+  #
+  # Example configuration:
+  # [[basics.output]]
+  #   # WebSocket URL of the LNS.
+  #   server = "wss://lns.example.com:3001"
+  #
+  #   # Only forward uplinks (discard downlinks from LNS).
+  #   # uplink_only = false
+  #
+  #   # WebSocket ping interval.
+  #   # ping_interval = "30s"
+  #
+  #   # Reconnect interval after connection loss.
+  #   # reconnect_interval = "5s"
+  #
+  #   # TLS certificate and key (optional, for wss:// connections).
+  #   # tls_cert = ""
+  #   # tls_key = ""
+  #   # ca_cert = ""
+  #
+  #   # Gateway ID prefix filters (allow list).
+  #   # gateway_id_prefixes = ["0016c001f184aa22/64"]
+  #
+  #   # Gateway ID deny list.
+  #   # gateway_id_deny = []
+  #
+  #   # Filter configuration.
+  #   # [basics.output.filters]
+  #   #   dev_addr_prefixes = []
+  #   #   dev_addr_deny = []
+  #   #   join_eui_prefixes = []
+  #   #   join_eui_deny = []
+  #
+  #   # Per-gateway authentication tokens.
+  #   #
+  #   # Maps gateway ID (hex) to an HTTP header sent during the WebSocket
+  #   # upgrade handshake. Values use the "Header-Name: value" format,
+  #   # matching the Basic Station tc.key file convention.
+  #   #
+  #   # When non-empty, this also acts as an implicit allow list: only
+  #   # gateways present in the map are forwarded. The gateway_id_prefixes
+  #   # and gateway_id_deny filters still apply on top.
+  #   #
+  #   # [basics.output.gateway_tokens]
+  #   #   "0016c001f184aa22" = "Authorization: Bearer NNSXS.xxx"
+  #   #   "aa555a0000000000" = "Authorization: Bearer NNSXS.yyy"
+
+
+# Monitoring configuration.
+#
+# These settings are optional. If not provided, monitoring is disabled.
+[monitoring]
+
+  # Interface:port.
+  #
+  # If set, this will enable the monitoring endpoints. If not set, the endpoint
+  # will be disabled. Endpoints:
+  #
+  # * /metrics: Exposes Prometheus metrics.
+  #
+  # Default: "" (disabled)
+  bind=""

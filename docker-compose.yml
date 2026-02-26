@@ -1,0 +1,17 @@
+services:
+  lorawan-multiplexer-converter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: -c /etc/lorawan-multiplexer-converter/config.toml
+    ports:
+      - "1700:1700/udp"   # Semtech UDP (GWMP)
+      - "3001:3001"        # Basic Station LNS (WebSocket)
+    volumes:
+      - ./config.toml:/etc/lorawan-multiplexer-converter/config.toml:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

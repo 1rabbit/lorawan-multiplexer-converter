@@ -5,7 +5,7 @@ use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
 use tracing::{Level, info};
 use tracing_subscriber::{filter, prelude::*};
 
-use chirpstack_packet_multiplexer::{cmd, config, forwarder, listener, monitoring};
+use lorawan_multiplexer_converter::{basicstation, cmd, config, forwarder, listener, monitoring, mqtt};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -34,7 +34,7 @@ async fn main() {
     }
 
     let filter = filter::Targets::new().with_targets(vec![(
-        "chirpstack_packet_multiplexer",
+        "lorawan_multiplexer_converter",
         Level::from_str(&config.logging.level).unwrap(),
     )]);
 
@@ -50,12 +50,22 @@ async fn main() {
         env!("CARGO_PKG_HOMEPAGE"),
     );
 
-    let (downlink_tx, uplink_rx) = listener::setup(&config.multiplexer.bind)
+    let (downlink_tx, uplink_rx, uplink_tx) = listener::setup(&config.gwmp.inputs)
         .await
         .expect("Setup listener");
-    forwarder::setup(downlink_tx, uplink_rx, config.multiplexer.servers.clone())
+    forwarder::setup(
+        downlink_tx.clone(),
+        uplink_rx,
+        config.gwmp.outputs.clone(),
+    )
+    .await
+    .expect("Setup forwarder");
+    mqtt::setup(&config.mqtt, downlink_tx.clone(), uplink_tx.clone())
         .await
-        .expect("Setup forwarder");
+        .expect("Setup MQTT");
+    basicstation::setup(&config.basics, downlink_tx, uplink_tx)
+        .await
+        .expect("Setup Basic Station");
     monitoring::setup(&config.monitoring.bind)
         .await
         .expect("Setup monitoring");

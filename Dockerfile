@@ -1,27 +1,28 @@
-# Copy binary stage
-FROM --platform=$BUILDPLATFORM alpine:3.22.2 as binary
+FROM rust:1-bookworm AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    unzip curl \
+    && rm -rf /var/lib/apt/lists/*
+# Install protoc with well-known types included
+RUN curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip -o protoc.zip \
+    && unzip protoc.zip -d /usr/local \
+    && rm protoc.zip
+RUN cargo install cargo-chef --locked
+WORKDIR /build
 
-ARG TARGETPLATFORM
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-COPY target/x86_64-unknown-linux-musl/release/chirpstack-packet-multiplexer /usr/bin/chirpstack-packet-multiplexer-x86_64
-COPY target/armv7-unknown-linux-musleabihf/release/chirpstack-packet-multiplexer /usr/bin/chirpstack-packet-multiplexer-armv7hf
-COPY target/aarch64-unknown-linux-musl/release/chirpstack-packet-multiplexer /usr/bin/chirpstack-packet-multiplexer-aarch64
+FROM chef AS build
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN cargo build --release
 
-RUN case "$TARGETPLATFORM" in \
-	"linux/amd64") \
-		cp /usr/bin/chirpstack-packet-multiplexer-x86_64 /usr/bin/chirpstack-packet-multiplexer; \
-		;; \
-	"linux/arm/v7") \
-		cp /usr/bin/chirpstack-packet-multiplexer-armv7hf /usr/bin/chirpstack-packet-multiplexer; \
-		;; \
-	"linux/arm64") \
-		cp /usr/bin/chirpstack-packet-multiplexer-aarch64 /usr/bin/chirpstack-packet-multiplexer; \
-		;; \
-	esac;
-
-# Final stage
-FROM alpine:3.22.2
-
-COPY --from=binary /usr/bin/chirpstack-packet-multiplexer /usr/bin/chirpstack-packet-multiplexer
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /build/target/release/lorawan-multiplexer-converter /usr/bin/lorawan-multiplexer-converter
 USER nobody:nogroup
-ENTRYPOINT ["/usr/bin/chirpstack-packet-multiplexer"]
+ENTRYPOINT ["/usr/bin/lorawan-multiplexer-converter"]
