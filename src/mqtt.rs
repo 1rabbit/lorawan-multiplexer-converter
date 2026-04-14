@@ -41,11 +41,15 @@ struct MqttGatewayInfo {
 /// Interval for sending PULL_DATA keepalives (5 seconds, matching typical gateway behavior)
 const PULL_DATA_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Maps virtual relay gateway IDs to their real border gateway for downlink routing.
-static RELAY_GATEWAYS: OnceCell<RwLock<std::collections::HashMap<GatewayId, RelayGatewayInfo>>> = OnceCell::const_new();
+/// Maps virtual relay gateway IDs to candidate border gateways for downlink routing.
+/// Multiple border gateways may receive the same relay uplink; we track all and
+/// pick the best (by RSSI, then SNR) when routing a downlink.
+static RELAY_GATEWAYS: OnceCell<RwLock<std::collections::HashMap<GatewayId, Vec<RelayBorderEntry>>>> = OnceCell::const_new();
 
-struct RelayGatewayInfo {
+struct RelayBorderEntry {
     border_gateway_id: GatewayId,
+    rssi: i32,
+    snr: f32,
     last_seen: std::time::Instant,
 }
 
@@ -1361,24 +1365,30 @@ pub async fn register_mqtt_gateway_pub(gateway_id: GatewayId, server: String, re
     register_mqtt_gateway(gateway_id, server, region, context).await;
 }
 
-/// Register a virtual relay gateway mapping to its real border gateway.
-pub async fn register_relay_gateway(virtual_id: GatewayId, border_id: GatewayId) {
+/// Register a border gateway candidate for a virtual relay gateway.
+/// If this border gateway was already registered for this virtual ID, update its signal and timestamp.
+pub async fn register_relay_gateway(virtual_id: GatewayId, border_id: GatewayId, rssi: i32, snr: f32) {
     let gateways = RELAY_GATEWAYS
         .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
         .await;
     let mut gateways = gateways.write().await;
-    if let Some(info) = gateways.get_mut(&virtual_id) {
-        info.border_gateway_id = border_id;
-        info.last_seen = std::time::Instant::now();
+    let entries = gateways.entry(virtual_id).or_insert_with(Vec::new);
+    if let Some(entry) = entries.iter_mut().find(|e| e.border_gateway_id == border_id) {
+        entry.rssi = rssi;
+        entry.snr = snr;
+        entry.last_seen = std::time::Instant::now();
     } else {
-        gateways.insert(virtual_id, RelayGatewayInfo {
+        entries.push(RelayBorderEntry {
             border_gateway_id: border_id,
+            rssi,
+            snr,
             last_seen: std::time::Instant::now(),
         });
     }
 }
 
-/// Resolve a virtual relay gateway to its real border gateway.
+/// Resolve a virtual relay gateway to the best border gateway.
+/// Picks the candidate with highest RSSI; ties broken by SNR.
 /// Returns None if the gateway_id is not a virtual relay gateway.
 pub async fn resolve_relay_gateway(gateway_id: GatewayId) -> Option<GatewayId> {
     let gateways = match RELAY_GATEWAYS.get() {
@@ -1386,10 +1396,24 @@ pub async fn resolve_relay_gateway(gateway_id: GatewayId) -> Option<GatewayId> {
         None => return None,
     };
     let gateways = gateways.read().await;
-    gateways.get(&gateway_id).map(|info| info.border_gateway_id)
+    let entries = gateways.get(&gateway_id)?;
+    let best = entries.iter()
+        .max_by(|a, b| {
+            a.rssi.cmp(&b.rssi)
+                .then(a.snr.partial_cmp(&b.snr).unwrap_or(std::cmp::Ordering::Equal))
+        })?;
+    debug!(
+        virtual_gateway = %gateway_id,
+        border_gateway = %best.border_gateway_id,
+        rssi = best.rssi,
+        snr = best.snr,
+        candidates = entries.len(),
+        "Resolved relay gateway (best RSSI)"
+    );
+    Some(best.border_gateway_id)
 }
 
-/// Periodically clean up stale relay gateway mappings.
+/// Periodically clean up stale relay gateway entries.
 async fn cleanup_relay_gateways() {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1398,11 +1422,23 @@ async fn cleanup_relay_gateways() {
             .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
             .await;
         let mut gateways = gateways.write().await;
+        let mut removed_entries = 0usize;
+        for entries in gateways.values_mut() {
+            let before = entries.len();
+            entries.retain(|e| e.last_seen.elapsed() < Duration::from_secs(300));
+            removed_entries += before - entries.len();
+        }
+        // Remove virtual IDs with no remaining candidates
         let before = gateways.len();
-        gateways.retain(|_, info| info.last_seen.elapsed() < Duration::from_secs(300));
-        let removed = before - gateways.len();
-        if removed > 0 {
-            info!(removed = removed, remaining = gateways.len(), "Cleaned up stale relay gateway mappings");
+        gateways.retain(|_, entries| !entries.is_empty());
+        let removed_virtuals = before - gateways.len();
+        if removed_entries > 0 || removed_virtuals > 0 {
+            info!(
+                removed_entries = removed_entries,
+                removed_virtuals = removed_virtuals,
+                remaining = gateways.len(),
+                "Cleaned up stale relay gateway mappings"
+            );
         }
     }
 }
@@ -1653,8 +1689,11 @@ async fn send_uplink_frame_to_backend(
             let virtual_hex = format!("{}{}", state.relay_gateway_id_prefix, rid);
             match GatewayId::from_hex(&virtual_hex) {
                 Ok(virtual_gw) => {
-                    // Register mapping for downlink routing
-                    register_relay_gateway(virtual_gw, gateway_id).await;
+                    // Register mapping for downlink routing (with signal quality for best-gateway selection)
+                    let (rssi, snr) = push_data.payload.rxpk.first()
+                        .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
+                        .unwrap_or((0, 0.0));
+                    register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
                     // Register virtual gateway in MQTT_GATEWAYS so downlinks can route back
                     let gw_info = {
                         let gateways = MQTT_GATEWAYS

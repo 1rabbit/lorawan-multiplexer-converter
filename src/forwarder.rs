@@ -265,8 +265,12 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, 
                 let virtual_hex = format!("{}{}", server.relay_gateway_id_prefix, rid);
                 match GatewayId::from_hex(&virtual_hex) {
                     Ok(virtual_gw) => {
-                        // Register mapping for downlink routing
-                        mqtt::register_relay_gateway(virtual_gw, gateway_id).await;
+                        // Register mapping for downlink routing (with signal quality for best-gateway selection)
+                        let (rssi, snr) = parsed_push_data.as_ref()
+                            .and_then(|pd| pd.payload.rxpk.first())
+                            .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
+                            .unwrap_or((0, 0.0));
+                        mqtt::register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
                         // Register virtual gateway in MQTT_GATEWAYS for downlink routing back
                         if let Some((srv, rgn, ctx)) = mqtt::get_mqtt_gateway_info(gateway_id).await {
                             mqtt::register_mqtt_gateway_pub(virtual_gw, srv, rgn, ctx).await;
