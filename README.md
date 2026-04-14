@@ -14,6 +14,7 @@ but substantially rewritten and extended.
 - **MQTT input**: Subscribe to uplinks from an MQTT broker and forward them onward (MQTT→UDP, MQTT→MQTT)
 - **Basic Station (LNS)**: Accept WebSocket connections from Basic Station gateways; connect to Basic Station network servers as a client
 - **Protocol conversion**: UDP↔MQTT↔Basic Station in any direction simultaneously
+- **Mesh relay virtualization**: Make ChirpStack mesh relays appear as independent gateways to any LNS. Configurable per output with a gateway ID prefix
 - **Allow/deny filtering**: Gateway ID, DevAddr, and JoinEUI prefix filters with explicit deny lists on every output. Deny takes precedence
 - **Analyzer mode**: Passive MQTT output that receives all traffic (including `application/#`) without affecting routing
 - **Environment variable substitution**: `$ENV_VAR` in config values
@@ -165,6 +166,40 @@ Docker Compose setup for spinning up multiple Mosquitto brokers with isolated cr
     [basics.output.filters]
       dev_addr_prefixes = []
       dev_addr_deny = []
+```
+
+### Mesh relay virtualization
+
+ChirpStack's [mesh relay](https://www.chirpstack.io/docs/chirpstack-mesh/) feature lets lightweight
+relay devices forward end-device packets through a border gateway. The relay's identity (`relay_id`)
+is carried in the protobuf `rx_info.metadata["relay_id"]` field of each uplink.
+
+ChirpStack natively understands this metadata, but other LNS platforms only see the border gateway.
+With `relay_gateway_id_prefix`, each mesh relay appears as its own gateway:
+
+- **Uplink**: The multiplexer detects `relay_id` in MQTT-in uplinks and replaces the gateway ID with
+  `prefix + relay_id` on outputs that have the prefix configured
+- **Downlink**: Downlinks targeting a virtual gateway are routed back through the original border gateway
+
+The prefix is configured **per output**, so you can choose which outputs see virtual gateways.
+Outputs without a prefix pass traffic through unchanged with the border gateway ID.
+
+```toml
+[[mqtt.input]]
+  server = "tcp://chirpstack:1883"    # border gateways report here
+
+[[gwmp.output]]
+  server = "other-lns.example.com:1700"
+  relay_gateway_id_prefix = "aabb0000"  # 8 hex chars (4 bytes)
+  # Relay with relay_id "11223344" → virtual gateway "aabb000011223344"
+
+[[mqtt.output]]
+  server = "tcp://other-lns:1883"
+  relay_gateway_id_prefix = "aabb0000"  # same or different prefix per output
+
+[[mqtt.output]]
+  server = "tcp://chirpstack-mirror:1883"
+  # No prefix → border gateway ID preserved
 ```
 
 ### Allow/Deny filter logic

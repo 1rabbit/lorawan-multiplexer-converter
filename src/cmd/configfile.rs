@@ -101,6 +101,7 @@ pub fn run(config: &Configuration) {
   [[gwmp.output]]
     server="{{this.server}}"
     uplink_only={{this.uplink_only}}
+    relay_gateway_id_prefix="{{this.relay_gateway_id_prefix}}"
     gateway_id_prefixes=[
       {{#each this.gateway_id_prefixes}}
       "{{this}}",
@@ -197,6 +198,7 @@ pub fn run(config: &Configuration) {
     uplink_only={{this.uplink_only}}
     analyzer={{this.analyzer}}
     forward_application={{this.forward_application}}
+    relay_gateway_id_prefix="{{this.relay_gateway_id_prefix}}"
     gateway_id_prefixes=[
       {{#each this.gateway_id_prefixes}}
       "{{this}}",

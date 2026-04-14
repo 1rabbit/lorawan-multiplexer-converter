@@ -59,6 +59,14 @@
   #   # Deny takes precedence over allow.
   #   gateway_id_deny=[]
   #
+  #   # Mesh relay virtual gateway prefix.
+  #   #
+  #   # When set, uplinks with relay_id in metadata (from ChirpStack mesh relays)
+  #   # will appear as virtual gateways with ID = prefix + relay_id.
+  #   # Must be exactly 8 hex characters (4 bytes). Example: "aabb0000"
+  #   # Downlinks to virtual gateways are routed back through the border gateway.
+  #   relay_gateway_id_prefix=""
+  #
   #   # Filter configuration.
   #   [gwmp.output.filters]
   #
@@ -197,6 +205,14 @@
   #   # Gateway ID deny list.
   #   # Deny takes precedence over allow.
   #   # gateway_id_deny=[]
+  #
+  #   # Mesh relay virtual gateway prefix.
+  #   #
+  #   # When set, uplinks with relay_id in metadata (from ChirpStack mesh relays)
+  #   # will appear as virtual gateways with ID = prefix + relay_id.
+  #   # Must be exactly 8 hex characters (4 bytes). Example: "aabb0000"
+  #   # Downlinks to virtual gateways are routed back through the border gateway.
+  #   relay_gateway_id_prefix="01337000"
   #
   #   # Filter configuration.
   #   [mqtt.output.filters]

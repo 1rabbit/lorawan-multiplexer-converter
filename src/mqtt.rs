@@ -41,6 +41,14 @@ struct MqttGatewayInfo {
 /// Interval for sending PULL_DATA keepalives (5 seconds, matching typical gateway behavior)
 const PULL_DATA_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Maps virtual relay gateway IDs to their real border gateway for downlink routing.
+static RELAY_GATEWAYS: OnceCell<RwLock<std::collections::HashMap<GatewayId, RelayGatewayInfo>>> = OnceCell::const_new();
+
+struct RelayGatewayInfo {
+    border_gateway_id: GatewayId,
+    last_seen: std::time::Instant,
+}
+
 struct State {
     client: AsyncClient,
     qos: QoS,
@@ -59,6 +67,8 @@ struct State {
     gateway_id_filters: GatewayIdFilters,
     filters: lrwn_filters::Filters,
     allow_deny_filters: AllowDenyFilters,
+    /// Mesh relay virtual gateway prefix (8 hex chars). Empty = disabled.
+    relay_gateway_id_prefix: String,
 }
 
 impl State {
@@ -89,7 +99,7 @@ impl State {
 pub async fn setup(
     config: &config::MqttConfig,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
 ) -> Result<()> {
     // Initialize the states vector
     STATES
@@ -104,6 +114,9 @@ pub async fn setup(
         setup_output(conf, downlink_tx.clone()).await?;
     }
 
+    // Spawn relay gateway cleanup task
+    tokio::spawn(cleanup_relay_gateways());
+
     Ok(())
 }
 
@@ -111,7 +124,7 @@ pub async fn setup(
 async fn setup_input(
     conf: &config::MqttInput,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
 ) -> Result<()> {
     info!(server = %conf.server, "Setting up MQTT input");
 
@@ -151,6 +164,7 @@ async fn setup_input(
         gateway_id_filters: gateway_id_filters.clone(),
         filters: filters.clone(),
         allow_deny_filters: allow_deny_filters.clone(),
+        relay_gateway_id_prefix: String::new(), // Inputs don't do relay rewriting
     };
 
     {
@@ -210,6 +224,29 @@ async fn setup_output(
         deny: conf.gateway_id_deny.clone(),
     };
 
+    // Validate relay prefix if set
+    let relay_prefix = if !conf.relay_gateway_id_prefix.is_empty() {
+        if conf.relay_gateway_id_prefix.len() != 8
+            || !conf.relay_gateway_id_prefix.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            error!(
+                server = %conf.server,
+                prefix = %conf.relay_gateway_id_prefix,
+                "Invalid relay_gateway_id_prefix (must be exactly 8 hex chars), disabling"
+            );
+            String::new()
+        } else {
+            info!(
+                server = %conf.server,
+                prefix = %conf.relay_gateway_id_prefix,
+                "Mesh relay gateway virtualization enabled"
+            );
+            conf.relay_gateway_id_prefix.clone()
+        }
+    } else {
+        String::new()
+    };
+
     let state = State {
         client,
         qos,
@@ -223,6 +260,7 @@ async fn setup_output(
         gateway_id_filters: gateway_id_filters.clone(),
         filters: filters.clone(),
         allow_deny_filters: allow_deny_filters.clone(),
+        relay_gateway_id_prefix: relay_prefix,
     };
 
     {
@@ -245,7 +283,7 @@ async fn setup_output(
 
     // Outputs don't produce uplinks, but event_loop still needs the channel types.
     // We create a dummy uplink_tx that is never read.
-    let (dummy_uplink_tx, _) = unbounded_channel::<(GatewayId, Vec<u8>, String)>();
+    let (dummy_uplink_tx, _) = unbounded_channel::<(GatewayId, Vec<u8>, String, Option<String>)>();
     let server = conf.server.clone();
     let json = conf.json;
     let reconnect_interval = conf.reconnect_interval;
@@ -415,7 +453,7 @@ async fn event_loop(
     mut eventloop: EventLoop,
     connect_tx: tokio::sync::mpsc::UnboundedSender<()>,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     reconnect_interval: Duration,
     server: String,
     subscribe_uplinks: bool,
@@ -479,7 +517,7 @@ async fn message_callback(
     original_topic: &str,
     payload: &[u8],
     downlink_tx: &UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     subscribe_uplinks: bool,
     json: bool,
     filters: &lrwn_filters::Filters,
@@ -555,8 +593,11 @@ async fn handle_downlink_message(
         "Received MQTT downlink"
     );
 
-    // Check if this is an MQTT gateway - if so, forward directly via MQTT
-    if is_mqtt_gateway(gateway_id).await {
+    // Check if this is an MQTT gateway (or a virtual relay gateway) - if so, forward via MQTT
+    let is_mqtt = is_mqtt_gateway(gateway_id).await;
+    let is_relay = !is_mqtt && resolve_relay_gateway(gateway_id).await.is_some();
+
+    if is_mqtt || is_relay {
         send_downlink_frame_direct(gateway_id, payload, original_topic).await?;
     } else {
         // Convert to PULL_RESP for UDP gateways
@@ -669,7 +710,7 @@ async fn handle_uplink_message(
     gateway_id_str: &str,
     payload: &[u8],
     original_topic: &str,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     _json: bool,
     filters: &lrwn_filters::Filters,
     allow_deny_filters: &AllowDenyFilters,
@@ -764,11 +805,37 @@ async fn handle_uplink_message(
     // Extract original rx_info.context for downlink routing (preserves gateway bridge's opaque context)
     let uplink_context = frame.rx_info.as_ref().map(|r| r.context.clone()).unwrap_or_default();
 
-    // Register this gateway as an MQTT-in gateway for downlink routing
+    // Register the border gateway as an MQTT-in gateway for downlink routing
     register_mqtt_gateway(gateway_id, server.to_string(), region.clone(), uplink_context).await;
 
-    // Forward directly to MQTT backends (pass-through, no conversion)
-    send_uplink_frame_direct(gateway_id, payload, original_topic, &frame.phy_payload).await?;
+    // Extract relay_id from metadata (present on mesh relay uplinks from ChirpStack)
+    let relay_id: Option<String> = frame.rx_info.as_ref()
+        .and_then(|rx| rx.metadata.get("relay_id"))
+        .cloned();
+
+    if let Some(ref rid) = relay_id {
+        info!(
+            server = %server,
+            gateway_id = %gateway_id,
+            relay_id = %rid,
+            "Detected mesh relay uplink"
+        );
+    }
+
+    // For relay packets, use per-backend path so each MQTT output can apply its own relay prefix.
+    // For normal packets, use raw passthrough for efficiency.
+    if relay_id.is_some() {
+        let rxpk = uplink_frame_to_rxpk(&frame)?;
+        let push_data_obj = PushData {
+            protocol_version: 0x02,
+            random_token: rand::random(),
+            gateway_id: *gateway_id.as_bytes(),
+            payload: crate::packets::PushDataPayload::new(vec![rxpk]),
+        };
+        send_uplink_frame(gateway_id, &push_data_obj, &region, relay_id.as_deref()).await?;
+    } else {
+        send_uplink_frame_direct(gateway_id, payload, original_topic, &frame.phy_payload).await?;
+    }
 
     // Skip UDP forwarding for downlink frames (mtype 3 = Unconfirmed Data Down, mtype 5 = Confirmed Data Down)
     // These don't make sense to convert to UDP PUSH_DATA
@@ -784,9 +851,9 @@ async fn handle_uplink_message(
     // Convert UplinkFrame to synthetic PushData packet for UDP forwarding
     let push_data = uplink_frame_to_push_data(&frame, &gateway_id)?;
 
-    // Send to uplink channel (for UDP servers)
+    // Send to uplink channel (for UDP servers), with relay_id for virtual gateway rewriting
     uplink_tx
-        .send((gateway_id, push_data, region))
+        .send((gateway_id, push_data, region, relay_id))
         .context("Uplink channel send")?;
 
     Ok(())
@@ -1178,7 +1245,7 @@ fn code_rate_to_string(code_rate: i32) -> &'static str {
 }
 
 /// Send an uplink frame to all configured MQTT backends.
-pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, region: &str) -> Result<()> {
+pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, region: &str, relay_id: Option<&str>) -> Result<()> {
     let states = match STATES.get() {
         Some(s) => s,
         None => return Ok(()), // MQTT not configured
@@ -1190,7 +1257,7 @@ pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, regi
     }
 
     for state in states.iter() {
-        if let Err(e) = send_uplink_frame_to_backend(gateway_id, push_data, state, region).await {
+        if let Err(e) = send_uplink_frame_to_backend(gateway_id, push_data, state, region, relay_id).await {
             error!(server = %state.server, error = %e, "Failed to send uplink to MQTT backend");
         }
     }
@@ -1276,6 +1343,70 @@ async fn get_mqtt_gateway_uplink_info(gateway_id: GatewayId) -> (Vec<u8>, Option
         .unwrap_or((Vec::new(), None))
 }
 
+/// Get the server, region, and context for an MQTT-in gateway.
+/// Used by forwarder to copy border gateway info to virtual relay gateways.
+pub async fn get_mqtt_gateway_info(gateway_id: GatewayId) -> Option<(String, String, Vec<u8>)> {
+    let gateways = match MQTT_GATEWAYS.get() {
+        Some(g) => g,
+        None => return None,
+    };
+    let gateways = gateways.read().await;
+    gateways.get(&gateway_id).map(|info| {
+        (info.server.clone(), info.region.clone(), info.last_context.clone())
+    })
+}
+
+/// Public wrapper for register_mqtt_gateway, used by forwarder for virtual relay gateways.
+pub async fn register_mqtt_gateway_pub(gateway_id: GatewayId, server: String, region: String, context: Vec<u8>) {
+    register_mqtt_gateway(gateway_id, server, region, context).await;
+}
+
+/// Register a virtual relay gateway mapping to its real border gateway.
+pub async fn register_relay_gateway(virtual_id: GatewayId, border_id: GatewayId) {
+    let gateways = RELAY_GATEWAYS
+        .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
+        .await;
+    let mut gateways = gateways.write().await;
+    if let Some(info) = gateways.get_mut(&virtual_id) {
+        info.border_gateway_id = border_id;
+        info.last_seen = std::time::Instant::now();
+    } else {
+        gateways.insert(virtual_id, RelayGatewayInfo {
+            border_gateway_id: border_id,
+            last_seen: std::time::Instant::now(),
+        });
+    }
+}
+
+/// Resolve a virtual relay gateway to its real border gateway.
+/// Returns None if the gateway_id is not a virtual relay gateway.
+pub async fn resolve_relay_gateway(gateway_id: GatewayId) -> Option<GatewayId> {
+    let gateways = match RELAY_GATEWAYS.get() {
+        Some(g) => g,
+        None => return None,
+    };
+    let gateways = gateways.read().await;
+    gateways.get(&gateway_id).map(|info| info.border_gateway_id)
+}
+
+/// Periodically clean up stale relay gateway mappings.
+async fn cleanup_relay_gateways() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let gateways = RELAY_GATEWAYS
+            .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
+            .await;
+        let mut gateways = gateways.write().await;
+        let before = gateways.len();
+        gateways.retain(|_, info| info.last_seen.elapsed() < Duration::from_secs(300));
+        let removed = before - gateways.len();
+        if removed > 0 {
+            info!(removed = removed, remaining = gateways.len(), "Cleaned up stale relay gateway mappings");
+        }
+    }
+}
+
 /// Send an uplink frame directly to MQTT backends (pass-through from MQTT-in).
 /// The payload and topic are forwarded as-is, only filtering is applied.
 async fn send_uplink_frame_direct(gateway_id: GatewayId, payload: &[u8], original_topic: &str, phy_payload: &[u8]) -> Result<()> {
@@ -1353,21 +1484,29 @@ async fn send_uplink_frame_direct(gateway_id: GatewayId, payload: &[u8], origina
 }
 
 /// Send a downlink frame directly to an MQTT-in gateway.
-/// The payload and topic are forwarded as-is.
+/// If the gateway_id is a virtual relay gateway, resolves to the border gateway and rewrites the topic.
 async fn send_downlink_frame_direct(gateway_id: GatewayId, payload: &[u8], topic: &str) -> Result<()> {
+    // Resolve virtual relay gateway to border gateway
+    let border_gw = resolve_relay_gateway(gateway_id).await;
+    let route_gw = border_gw.unwrap_or(gateway_id);
+
     // Get the server this gateway is associated with
-    let server = {
+    let (server, region) = {
         let gateways = match MQTT_GATEWAYS.get() {
             Some(g) => g,
             None => return Err(anyhow!("MQTT gateways not initialized")),
         };
         let gateways = gateways.read().await;
-        gateways.get(&gateway_id).map(|info| info.server.clone())
-    };
+        gateways.get(&route_gw).map(|info| (info.server.clone(), info.region.clone()))
+    }
+    .ok_or_else(|| anyhow!("Gateway {} not registered as MQTT gateway", route_gw))?;
 
-    let server = match server {
-        Some(s) => s,
-        None => return Err(anyhow!("Gateway {} not registered as MQTT gateway", gateway_id)),
+    // Reconstruct topic with border gateway if this is a relay
+    let effective_topic = if border_gw.is_some() {
+        let route_gw_str = route_gw.to_string();
+        format!("{}/gateway/{}/command/down", region, route_gw_str)
+    } else {
+        topic.to_string()
     };
 
     // Find the MQTT-in backend for this gateway
@@ -1379,15 +1518,25 @@ async fn send_downlink_frame_direct(gateway_id: GatewayId, payload: &[u8], topic
     let states = states.read().await;
     for state in states.iter() {
         if state.server == server && state.subscribe_uplinks {
-            info!(
-                server = %state.server,
-                gateway_id = %gateway_id,
-                "Forwarding MQTT downlink"
-            );
+            if border_gw.is_some() {
+                info!(
+                    server = %state.server,
+                    virtual_gateway = %gateway_id,
+                    border_gateway = %route_gw,
+                    topic = %effective_topic,
+                    "Forwarding MQTT downlink (relay → border gateway)"
+                );
+            } else {
+                info!(
+                    server = %state.server,
+                    gateway_id = %gateway_id,
+                    "Forwarding MQTT downlink"
+                );
+            }
 
             state
                 .client
-                .publish(topic, state.qos, false, payload)
+                .publish(&effective_topic, state.qos, false, payload)
                 .await
                 .context("MQTT publish downlink")?;
 
@@ -1395,22 +1544,35 @@ async fn send_downlink_frame_direct(gateway_id: GatewayId, payload: &[u8], topic
         }
     }
 
-    Err(anyhow!("No MQTT-in backend found for gateway {}", gateway_id))
+    Err(anyhow!("No MQTT-in backend found for gateway {}", route_gw))
 }
 
 /// Send a downlink frame to an MQTT-in gateway.
 /// The data is expected to be a PULL_RESP packet (Semtech UDP format).
+/// If the gateway_id is a virtual relay gateway, resolves to the border gateway.
 pub async fn send_downlink_frame(gateway_id: GatewayId, data: &[u8]) -> Result<()> {
-    // Get the server and region this gateway is associated with
+    // Resolve virtual relay gateway to border gateway for routing
+    let border_gw = resolve_relay_gateway(gateway_id).await;
+    let route_gw = border_gw.unwrap_or(gateway_id);
+
+    if let Some(bgw) = border_gw {
+        info!(
+            virtual_gateway = %gateway_id,
+            border_gateway = %bgw,
+            "Resolving relay downlink to border gateway"
+        );
+    }
+
+    // Get the server and region for the gateway we're routing to (border or original)
     let (server, region) = {
         let gateways = match MQTT_GATEWAYS.get() {
             Some(g) => g,
             None => return Err(anyhow!("MQTT gateways not initialized")),
         };
         let gateways = gateways.read().await;
-        gateways.get(&gateway_id).map(|info| (info.server.clone(), info.region.clone()))
+        gateways.get(&route_gw).map(|info| (info.server.clone(), info.region.clone()))
     }
-    .ok_or_else(|| anyhow!("Gateway {} not registered as MQTT gateway", gateway_id))?;
+    .ok_or_else(|| anyhow!("Gateway {} not registered as MQTT gateway", route_gw))?;
 
     // Parse the PULL_RESP packet to get the downlink frame
     let pull_resp = PullResp::from_slice(data)?;
@@ -1421,27 +1583,26 @@ pub async fn send_downlink_frame(gateway_id: GatewayId, data: &[u8]) -> Result<(
         None => return Err(anyhow!("MQTT states not initialized")),
     };
 
-    // Look up stored original uplink context for this gateway
-    let (stored_context, stored_tmst) = get_mqtt_gateway_uplink_info(gateway_id).await;
+    // Look up stored original uplink context for the border gateway
+    let (stored_context, stored_tmst) = get_mqtt_gateway_uplink_info(route_gw).await;
 
     let states = states.read().await;
     for state in states.iter() {
         if state.server == server && state.subscribe_uplinks {
-            // This is the MQTT-in backend that received uplinks from this gateway
-            // Send the downlink back via this backend
-            let gateway_id_str = gateway_id.to_string();
-            let topic = format!("{}/gateway/{}/command/down", region, gateway_id_str);
+            // Route downlink to the border gateway's MQTT topic
+            let route_gw_str = route_gw.to_string();
+            let topic = format!("{}/gateway/{}/command/down", region, route_gw_str);
 
             // Convert PULL_RESP to ChirpStack DownlinkFrame, using original uplink
             // context when available so the gateway bridge can properly schedule TX
             let frame = if !stored_context.is_empty() {
                 pull_resp.to_downlink_frame_with_context(
-                    &gateway_id,
+                    &route_gw,
                     Some(stored_context.clone()),
                     stored_tmst,
                 )?
             } else {
-                pull_resp.to_downlink_frame(&gateway_id)?
+                pull_resp.to_downlink_frame(&route_gw)?
             };
 
             let payload = if state.json {
@@ -1451,7 +1612,8 @@ pub async fn send_downlink_frame(gateway_id: GatewayId, data: &[u8]) -> Result<(
             };
 
             info!(
-                gateway_id = %gateway_id,
+                gateway_id = %route_gw,
+                virtual_gateway = %gateway_id,
                 server = %state.server,
                 topic = %topic,
                 has_original_context = !stored_context.is_empty(),
@@ -1477,6 +1639,7 @@ async fn send_uplink_frame_to_backend(
     push_data: &PushData,
     state: &State,
     region: &str,
+    relay_id: Option<&str>,
 ) -> Result<()> {
     // Skip backends that subscribe to uplinks (MQTT-in) to avoid feedback loops
     if state.subscribe_uplinks {
@@ -1484,9 +1647,49 @@ async fn send_uplink_frame_to_backend(
         return Ok(());
     }
 
+    // Determine effective gateway_id: apply relay prefix if configured and relay_id present
+    let effective_gateway_id = if let Some(rid) = relay_id {
+        if !state.relay_gateway_id_prefix.is_empty() {
+            let virtual_hex = format!("{}{}", state.relay_gateway_id_prefix, rid);
+            match GatewayId::from_hex(&virtual_hex) {
+                Ok(virtual_gw) => {
+                    // Register mapping for downlink routing
+                    register_relay_gateway(virtual_gw, gateway_id).await;
+                    // Register virtual gateway in MQTT_GATEWAYS so downlinks can route back
+                    let gw_info = {
+                        let gateways = MQTT_GATEWAYS
+                            .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
+                            .await;
+                        let gateways = gateways.read().await;
+                        gateways.get(&gateway_id).map(|info| (info.server.clone(), info.region.clone(), info.last_context.clone()))
+                    };
+                    if let Some((server, gw_region, context)) = gw_info {
+                        register_mqtt_gateway(virtual_gw, server, gw_region, context).await;
+                    }
+                    info!(
+                        server = %state.server,
+                        border_gateway = %gateway_id,
+                        virtual_gateway = %virtual_gw,
+                        relay_id = %rid,
+                        "Rewriting gateway_id for mesh relay (MQTT output)"
+                    );
+                    virtual_gw
+                }
+                Err(e) => {
+                    warn!(relay_id = %rid, prefix = %state.relay_gateway_id_prefix, error = %e, "Invalid virtual gateway ID, using original");
+                    gateway_id
+                }
+            }
+        } else {
+            gateway_id
+        }
+    } else {
+        gateway_id
+    };
+
     // Check gateway ID filters (new allow/deny takes precedence)
-    if !state.match_gateway_id(gateway_id) {
-        debug!(gateway_id = %gateway_id, server = %state.server, "Gateway ID does not match MQTT filters");
+    if !state.match_gateway_id(effective_gateway_id) {
+        debug!(gateway_id = %effective_gateway_id, server = %state.server, "Gateway ID does not match MQTT filters");
         return Ok(());
     }
 
@@ -1550,11 +1753,26 @@ async fn send_uplink_frame_to_backend(
         return Ok(());
     }
 
-    let gateway_id_str = gateway_id.to_string();
-    let topic = format!("{}/gateway/{}/event/up", region, gateway_id_str);
+    // Strip relay metadata when relay rewriting is active, so downstream
+    // LNS doesn't see relay_id/hop_count and try to handle it itself.
+    if effective_gateway_id != gateway_id {
+        for rxpk in &mut filtered_push_data.rxpk {
+            if let Some(ref mut meta) = rxpk.meta {
+                meta.remove("relay_id");
+                meta.remove("hop_count");
+                if meta.is_empty() {
+                    rxpk.meta = None;
+                }
+            }
+        }
+        debug!(server = %state.server, "Stripped relay metadata from uplink");
+    }
+
+    let effective_gw_str = effective_gateway_id.to_string();
+    let topic = format!("{}/gateway/{}/event/up", region, effective_gw_str);
 
     for rxpk in &filtered_push_data.rxpk {
-        let frame = rxpk.to_uplink_frame(&gateway_id_str);
+        let frame = rxpk.to_uplink_frame(&effective_gw_str);
 
         let payload = if state.json {
             serde_json::to_vec(&frame)?
@@ -1573,7 +1791,7 @@ async fn send_uplink_frame_to_backend(
     }
 
     info!(
-        gateway_id = %gateway_id,
+        gateway_id = %effective_gateway_id,
         server = %state.server,
         topic = %topic,
         dev_addr = %dev_addr_str,

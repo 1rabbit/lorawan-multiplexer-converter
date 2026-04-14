@@ -238,7 +238,7 @@ struct GenericMessage {
 pub async fn setup(
     config: &config::BasicsConfig,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
 ) -> Result<()> {
     BS_GATEWAYS
         .get_or_init(|| async { RwLock::new(HashMap::new()) })
@@ -463,7 +463,7 @@ pub async fn send_tx_ack(
 async fn setup_input(
     conf: &config::BasicsInput,
     _downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
 ) -> Result<()> {
     info!(bind = %conf.bind, topic_prefix = %conf.topic_prefix, "Setting up Basic Station input");
 
@@ -589,7 +589,7 @@ async fn handle_gateway_ws(
     region: String,
     router_config: config::RouterConfig,
     dr_table: Vec<[i32; 3]>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     ping_interval: Duration,
     read_timeout: Duration,
     gateway_id_filters: GatewayIdFilters,
@@ -764,7 +764,7 @@ async fn handle_bs_message(
     text: &str,
     region: &str,
     dr_table: &[[i32; 3]],
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     ws_sink: &mut futures_util::stream::SplitSink<WebSocket, AxumMessage>,
     allow_deny_filters: &AllowDenyFilters,
 ) -> Result<()> {
@@ -819,7 +819,7 @@ async fn handle_updf(
     original_text: &str,
     region: &str,
     dr_table: &[[i32; 3]],
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     allow_deny_filters: &AllowDenyFilters,
 ) -> Result<()> {
     // Update last xtime/rctx.
@@ -875,7 +875,7 @@ async fn handle_updf(
     let data = push_data.to_bytes();
 
     uplink_tx
-        .send((gateway_id, data, region.to_string()))
+        .send((gateway_id, data, region.to_string(), None))
         .context("Uplink channel send")?;
 
     Ok(())
@@ -887,7 +887,7 @@ async fn handle_jreq(
     original_text: &str,
     region: &str,
     dr_table: &[[i32; 3]],
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     allow_deny_filters: &AllowDenyFilters,
 ) -> Result<()> {
     // Update last xtime/rctx.
@@ -933,7 +933,7 @@ async fn handle_jreq(
     let data = push_data.to_bytes();
 
     uplink_tx
-        .send((gateway_id, data, region.to_string()))
+        .send((gateway_id, data, region.to_string(), None))
         .context("Uplink channel send")?;
 
     Ok(())

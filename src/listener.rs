@@ -31,10 +31,10 @@ pub async fn setup(
     inputs: &[config::GwmpInput],
 ) -> Result<(
     UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,  // downlink_tx (gateway_id, data, downlink_id)
-    UnboundedReceiver<(GatewayId, Vec<u8>, String)>, // uplink_rx (gateway_id, data, region)
-    UnboundedSender<(GatewayId, Vec<u8>, String)>,  // uplink_tx (for MQTT-in)
+    UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>)>, // uplink_rx (gateway_id, data, region)
+    UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,  // uplink_tx (for MQTT-in)
 )> {
-    let (uplink_tx, uplink_rx) = unbounded_channel::<(GatewayId, Vec<u8>, String)>();
+    let (uplink_tx, uplink_rx) = unbounded_channel::<(GatewayId, Vec<u8>, String, Option<String>)>();
     let (downlink_tx, downlink_rx) = unbounded_channel::<(GatewayId, Vec<u8>, Option<u32>)>();
 
     for input in inputs {
@@ -53,7 +53,7 @@ pub async fn setup(
     Ok((downlink_tx, uplink_rx, uplink_tx))
 }
 
-async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String)>, topic_prefix: String) {
+async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>, topic_prefix: String) {
     let mut buffer: [u8; 65535] = [0; 65535];
     loop {
         let (size, addr) = match socket.recv_from(&mut buffer).await {
@@ -80,7 +80,7 @@ async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(Gatew
 
 async fn handle_uplink_packet(
     socket: &Arc<UdpSocket>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     addr: SocketAddr,
     data: &[u8],
     topic_prefix: &str,
@@ -156,11 +156,24 @@ async fn handle_downlink_packet(
         return Ok(());
     }
 
-    // Check if this is an MQTT gateway
+    // Check if this is an MQTT gateway (includes virtual relay gateways)
     if mqtt::is_mqtt_gateway(gateway_id).await {
-        // Route via MQTT
+        // Route via MQTT (send_downlink_frame handles relay→border resolution)
         mqtt::send_downlink_frame(gateway_id, data).await?;
         return Ok(());
+    }
+
+    // Fallback: check if this is a virtual relay gateway whose border gateway is an MQTT gateway
+    if let Some(border_gw) = mqtt::resolve_relay_gateway(gateway_id).await {
+        if mqtt::is_mqtt_gateway(border_gw).await {
+            info!(
+                virtual_gateway = %gateway_id,
+                border_gateway = %border_gw,
+                "Routing relay downlink to border gateway (fallback)"
+            );
+            mqtt::send_downlink_frame(gateway_id, data).await?;
+            return Ok(());
+        }
     }
 
     // For PULL_RESP, extract the token and store the mapping to the real downlink_id
@@ -194,7 +207,7 @@ async fn handle_downlink_packet(
 
 async fn handle_push_data(
     socket: &Arc<UdpSocket>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     addr: SocketAddr,
     gateway_id: GatewayId,
     data: &[u8],
@@ -212,21 +225,21 @@ async fn handle_push_data(
 
     debug!("Sending received data to uplink channel");
     uplink_tx
-        .send((gateway_id, data.to_vec(), topic_prefix.to_string()))
+        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None))
         .context("Uplink channel send")?;
 
     Ok(())
 }
 
 async fn handle_tx_ack(
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     gateway_id: GatewayId,
     data: &[u8],
     topic_prefix: &str,
 ) -> Result<()> {
     // Forward to UDP servers via uplink channel
     uplink_tx
-        .send((gateway_id, data.to_vec(), topic_prefix.to_string()))
+        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None))
         .context("Uplink channel send")?;
 
     // Forward to MQTT backends if enabled
@@ -278,7 +291,7 @@ async fn handle_tx_ack(
 
 async fn handle_pull_data(
     socket: &Arc<UdpSocket>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
     addr: SocketAddr,
     gateway_id: GatewayId,
     data: &[u8],
@@ -295,7 +308,7 @@ async fn handle_pull_data(
     inc_gateway_udp_sent_count(gateway_id, PacketType::PullAck).await;
 
     uplink_tx
-        .send((gateway_id, data.to_vec(), topic_prefix.to_string()))
+        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None))
         .context("Uplink channel send")?;
 
     Ok(())

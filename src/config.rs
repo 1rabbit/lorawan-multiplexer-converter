@@ -82,6 +82,9 @@ pub struct GwmpOutput {
     // Deny list (prefixes that are rejected, takes precedence over allow)
     pub gateway_id_deny: Vec<lrwn_filters::EuiPrefix>,
     pub filters: Filters,
+    // Mesh relay virtual gateway prefix (8 hex chars / 4 bytes).
+    // When set, uplinks with relay_id in metadata get gateway_id = prefix + relay_id.
+    pub relay_gateway_id_prefix: String,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -182,6 +185,9 @@ pub struct MqttOutput {
     // Deny list (prefixes that are rejected, takes precedence over allow)
     pub gateway_id_deny: Vec<lrwn_filters::EuiPrefix>,
     pub filters: Filters,
+    // Mesh relay virtual gateway prefix (8 hex chars / 4 bytes).
+    // When set, uplinks with relay_id in metadata get gateway_id = prefix + relay_id.
+    pub relay_gateway_id_prefix: String,
 }
 
 impl Default for MqttOutput {
@@ -206,6 +212,7 @@ impl Default for MqttOutput {
             gateway_id_prefixes: Vec::new(),
             gateway_id_deny: Vec::new(),
             filters: Filters::default(),
+            relay_gateway_id_prefix: String::new(),
         }
     }
 }

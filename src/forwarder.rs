@@ -27,6 +27,8 @@ struct Server {
     allow_deny_filters: AllowDenyFilters,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
     sockets: HashMap<GatewayId, ServerSocket>,
+    /// Mesh relay virtual gateway prefix (8 hex chars). Empty = disabled.
+    relay_gateway_id_prefix: String,
 }
 
 impl Server {
@@ -109,7 +111,7 @@ struct ServerSocket {
 
 pub async fn setup(
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String)>,
+    uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>)>,
     outputs: Vec<config::GwmpOutput>,
 ) -> Result<()> {
     info!("Setting up forwarder");
@@ -126,6 +128,29 @@ pub async fn setup(
             join_eui_deny: output.filters.join_eui_deny.clone(),
         };
 
+        // Validate relay prefix
+        let relay_prefix = if !output.relay_gateway_id_prefix.is_empty() {
+            if output.relay_gateway_id_prefix.len() != 8
+                || !output.relay_gateway_id_prefix.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                error!(
+                    server = %output.server,
+                    prefix = %output.relay_gateway_id_prefix,
+                    "Invalid relay_gateway_id_prefix (must be exactly 8 hex chars), disabling"
+                );
+                String::new()
+            } else {
+                info!(
+                    server = %output.server,
+                    prefix = %output.relay_gateway_id_prefix,
+                    "Mesh relay gateway virtualization enabled"
+                );
+                output.relay_gateway_id_prefix.clone()
+            }
+        } else {
+            String::new()
+        };
+
         add_server(
             output.server.clone(),
             output.uplink_only,
@@ -138,6 +163,7 @@ pub async fn setup(
             },
             allow_deny_filters,
             downlink_tx.clone(),
+            relay_prefix,
         )
         .await?;
     }
@@ -148,15 +174,15 @@ pub async fn setup(
     Ok(())
 }
 
-async fn handle_uplink(mut uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String)>) {
-    while let Some((gateway_id, data, region)) = uplink_rx.recv().await {
-        if let Err(e) = handle_uplink_packet(gateway_id, &data, &region).await {
+async fn handle_uplink(mut uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>)>) {
+    while let Some((gateway_id, data, region, relay_id)) = uplink_rx.recv().await {
+        if let Err(e) = handle_uplink_packet(gateway_id, &data, &region, relay_id.as_deref()).await {
             error!(error = %e.full(), "Handle uplink error");
         }
     }
 }
 
-async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) -> Result<()> {
+async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, relay_id: Option<&str>) -> Result<()> {
     let packet_type = PacketType::try_from(data)?;
     let random_token = get_random_token(data)?;
 
@@ -206,7 +232,7 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
     // Skip if this is an MQTT gateway - uplinks from MQTT-in are already forwarded directly
     if let Some(push_data) = &parsed_push_data {
         if mqtt::is_enabled().await && !mqtt::is_mqtt_gateway(gateway_id).await {
-            if let Err(e) = mqtt::send_uplink_frame(gateway_id, push_data, region).await {
+            if let Err(e) = mqtt::send_uplink_frame(gateway_id, push_data, region, relay_id).await {
                 error!(error = %e, "MQTT send uplink error");
             }
             if let Some(stats) = push_data.to_gateway_stats() {
@@ -233,7 +259,40 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
     let mut servers = servers.write().await;
 
     for server in servers.iter_mut() {
-        if !server.match_gateway_id(gateway_id) {
+        // Determine effective gateway_id for this server (relay rewriting)
+        let (effective_gw, is_relay) = if let Some(rid) = relay_id {
+            if !server.relay_gateway_id_prefix.is_empty() {
+                let virtual_hex = format!("{}{}", server.relay_gateway_id_prefix, rid);
+                match GatewayId::from_hex(&virtual_hex) {
+                    Ok(virtual_gw) => {
+                        // Register mapping for downlink routing
+                        mqtt::register_relay_gateway(virtual_gw, gateway_id).await;
+                        // Register virtual gateway in MQTT_GATEWAYS for downlink routing back
+                        if let Some((srv, rgn, ctx)) = mqtt::get_mqtt_gateway_info(gateway_id).await {
+                            mqtt::register_mqtt_gateway_pub(virtual_gw, srv, rgn, ctx).await;
+                        }
+                        info!(
+                            server = %server.server,
+                            border_gateway = %gateway_id,
+                            virtual_gateway = %virtual_gw,
+                            relay_id = %rid,
+                            "Rewriting gateway_id for mesh relay (UDP output)"
+                        );
+                        (virtual_gw, true)
+                    }
+                    Err(e) => {
+                        warn!(relay_id = %rid, error = %e, "Invalid virtual gateway ID, using original");
+                        (gateway_id, false)
+                    }
+                }
+            } else {
+                (gateway_id, false)
+            }
+        } else {
+            (gateway_id, false)
+        };
+
+        if !server.match_gateway_id(effective_gw) {
             continue;
         }
 
@@ -242,7 +301,7 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
         let allow_deny_filters = server.allow_deny_filters.clone();
         let server_name = server.server.clone();
 
-        let socket = server.get_server_socket(gateway_id).await?;
+        let socket = server.get_server_socket(effective_gw).await?;
         socket.last_uplink = SystemTime::now();
 
         let span = tracing::info_span!("", addr = %socket.socket.peer_addr().unwrap());
@@ -261,23 +320,48 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
                     if push_data.payload.rxpk.is_empty() {
                         // Stat-only packet (no rxpk) — forward raw bytes regardless of filters.
                         if !push_data.payload.is_empty() {
-                            info!(gateway_id = %gateway_id, "Forwarding UDP stats");
-                            socket.push_data_token = Some(random_token);
-                            socket.socket.send(data).await.context("Send UDP packet")?;
+                            if is_relay {
+                                // Must re-serialize with virtual gateway_id
+                                let mut rewritten = push_data.clone();
+                                rewritten.gateway_id = *effective_gw.as_bytes();
+                                let rewritten_data = rewritten.to_bytes();
+                                info!(gateway_id = %effective_gw, "Forwarding UDP stats (relay)");
+                                socket.push_data_token = Some(random_token);
+                                socket.socket.send(&rewritten_data).await.context("Send UDP packet")?;
+                            } else {
+                                info!(gateway_id = %effective_gw, "Forwarding UDP stats");
+                                socket.push_data_token = Some(random_token);
+                                socket.socket.send(data).await.context("Send UDP packet")?;
+                            }
                             inc_server_udp_sent_count(&server_name, packet_type).await;
                         } else {
                             debug!("Nothing to send, UDP packet is empty");
                         }
-                    } else if !has_payload_filters {
-                        // No payload filters — raw passthrough.
-                        info!(gateway_id = %gateway_id, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
+                    } else if !has_payload_filters && !is_relay {
+                        // No payload filters and no relay rewrite — raw passthrough.
+                        info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
                         socket.push_data_token = Some(random_token);
                         socket.socket.send(data).await.context("Send UDP packet")?;
                         inc_server_udp_sent_count(&server_name, packet_type).await;
                     } else {
-                        // Filters configured — check each rxpk against them.
+                        // Filters configured or relay rewrite needed — must process.
                         let original_count = push_data.payload.rxpk.len();
                         let mut filtered_push_data = push_data.clone();
+
+                        // Apply relay gateway_id rewrite and strip relay metadata
+                        if is_relay {
+                            filtered_push_data.gateway_id = *effective_gw.as_bytes();
+                            for rxpk in &mut filtered_push_data.payload.rxpk {
+                                if let Some(ref mut meta) = rxpk.meta {
+                                    meta.remove("relay_id");
+                                    meta.remove("hop_count");
+                                    if meta.is_empty() {
+                                        rxpk.meta = None;
+                                    }
+                                }
+                            }
+                            debug!(server = %server_name, "Stripped relay metadata from uplink");
+                        }
 
                         if !allow_deny_filters.dev_addr_deny.is_empty()
                             || !allow_deny_filters.join_eui_deny.is_empty()
@@ -285,7 +369,9 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
                             filtered_push_data
                                 .payload
                                 .filter_rxpk_allow_deny(&allow_deny_filters);
-                        } else {
+                        } else if !filters.dev_addr_prefixes.is_empty()
+                            || !filters.join_eui_prefixes.is_empty()
+                        {
                             filtered_push_data
                                 .payload
                                 .filter_rxpk(&filters);
@@ -296,16 +382,16 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
                         if remaining_count == 0 {
                             // All rxpk removed — drop.
                             debug!("Nothing to send, UDP packet does not match filters");
-                        } else if remaining_count == original_count {
-                            // All rxpk passed — send original raw bytes.
-                            info!(gateway_id = %gateway_id, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
+                        } else if remaining_count == original_count && !is_relay {
+                            // All rxpk passed and no relay — send original raw bytes.
+                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
                             socket.push_data_token = Some(random_token);
                             socket.socket.send(data).await.context("Send UDP packet")?;
                             inc_server_udp_sent_count(&server_name, packet_type).await;
                         } else {
-                            // Some rxpk removed — must re-serialize.
+                            // Re-serialize (filtered or relay-rewritten).
                             let filtered_data = filtered_push_data.to_bytes();
-                            info!(gateway_id = %gateway_id, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink (filtered)");
+                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink (filtered)");
                             socket.push_data_token = Some(random_token);
                             socket.socket.send(&filtered_data).await.context("Send UDP packet")?;
                             inc_server_udp_sent_count(&server_name, packet_type).await;
@@ -314,9 +400,18 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str) 
                 }
             }
             PacketType::PullData => {
-                info!(packet_type = %packet_type, "Sending UDP packet");
-                socket.pull_data_token = Some(random_token);
-                socket.socket.send(data).await.context("Send UDP packet")?;
+                if is_relay {
+                    // Send PULL_DATA with virtual gateway_id
+                    let pull_data = PullData::new(&effective_gw);
+                    let pd_data = pull_data.to_bytes();
+                    info!(packet_type = %packet_type, gateway_id = %effective_gw, "Sending UDP packet (relay)");
+                    socket.pull_data_token = Some(pull_data.random_token);
+                    socket.socket.send(&pd_data).await.context("Send UDP packet")?;
+                } else {
+                    info!(packet_type = %packet_type, "Sending UDP packet");
+                    socket.pull_data_token = Some(random_token);
+                    socket.socket.send(data).await.context("Send UDP packet")?;
+                }
                 inc_server_udp_sent_count(&server_name, packet_type).await;
             }
             PacketType::TxAck => {
@@ -444,11 +539,13 @@ async fn add_server(
     filters: lrwn_filters::Filters,
     allow_deny_filters: AllowDenyFilters,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
+    relay_gateway_id_prefix: String,
 ) -> Result<()> {
     info!(
         server = server,
         uplink_only = uplink_only,
         gateway_id_prefixes = ?gateway_id_prefixes,
+        relay_gateway_id_prefix = %relay_gateway_id_prefix,
         "Adding server"
     );
 
@@ -466,6 +563,7 @@ async fn add_server(
         allow_deny_filters,
         downlink_tx,
         sockets: HashMap::new(),
+        relay_gateway_id_prefix,
     });
 
     Ok(())
