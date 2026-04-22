@@ -311,6 +311,17 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, 
         let span = tracing::info_span!("", addr = %socket.socket.peer_addr().unwrap());
         let _enter = span.enter();
 
+        // For relay virtual gateways, send PULL_DATA before the uplink so the
+        // LNS knows where to route downlinks for this virtual MAC.
+        if is_relay {
+            let pull_data = PullData::new(&effective_gw);
+            let pd_data = pull_data.to_bytes();
+            debug!(gateway_id = %effective_gw, "Sending PULL_DATA for virtual relay gateway");
+            socket.pull_data_token = Some(pull_data.random_token);
+            socket.socket.send(&pd_data).await.context("Send relay PULL_DATA")?;
+            inc_server_udp_sent_count(&server_name, PacketType::PullData).await;
+        }
+
         match packet_type {
             PacketType::PushData => {
                 if let Some(push_data) = &parsed_push_data {
