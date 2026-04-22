@@ -810,7 +810,7 @@ async fn handle_uplink_message(
     let uplink_context = frame.rx_info.as_ref().map(|r| r.context.clone()).unwrap_or_default();
 
     // Register the border gateway as an MQTT-in gateway for downlink routing
-    register_mqtt_gateway(gateway_id, server.to_string(), region.clone(), uplink_context).await;
+    register_mqtt_gateway(gateway_id, server.to_string(), region.clone(), uplink_context, false).await;
 
     // Extract relay_id from metadata (present on mesh relay uplinks from ChirpStack)
     let relay_id: Option<String> = frame.rx_info.as_ref()
@@ -903,7 +903,7 @@ async fn handle_event_passthrough(
     // Extract region from topic and register this gateway as an MQTT-in gateway for downlink routing
     // Event passthrough doesn't have uplink context, pass empty (won't overwrite existing context)
     let region = extract_region_from_topic(original_topic);
-    register_mqtt_gateway(gateway_id, server.to_string(), region, Vec::new()).await;
+    register_mqtt_gateway(gateway_id, server.to_string(), region, Vec::new(), false).await;
 
     // Forward directly to MQTT backends (pass-through)
     send_event_passthrough(gateway_id, payload, original_topic, event_type).await?;
@@ -1271,12 +1271,17 @@ pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, regi
 
 /// Register a gateway as an MQTT-in gateway for downlink routing.
 /// Also sends PULL_DATA to UDP servers if needed (first registration or keepalive expired).
-async fn register_mqtt_gateway(gateway_id: GatewayId, server: String, region: String, context: Vec<u8>) {
+///
+/// `skip_pull_data`: set true when the caller already holds the forwarder SERVERS lock
+/// (e.g. called from within the forwarder uplink loop) to avoid a deadlock.
+async fn register_mqtt_gateway(gateway_id: GatewayId, server: String, region: String, context: Vec<u8>, skip_pull_data: bool) {
     let gateways = MQTT_GATEWAYS
         .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
         .await;
 
-    let should_send_pull_data = {
+    let should_send_pull_data = if skip_pull_data {
+        false
+    } else {
         let gateways = gateways.read().await;
         match gateways.get(&gateway_id) {
             None => true, // First registration
@@ -1362,7 +1367,8 @@ pub async fn get_mqtt_gateway_info(gateway_id: GatewayId) -> Option<(String, Str
 
 /// Public wrapper for register_mqtt_gateway, used by forwarder for virtual relay gateways.
 pub async fn register_mqtt_gateway_pub(gateway_id: GatewayId, server: String, region: String, context: Vec<u8>) {
-    register_mqtt_gateway(gateway_id, server, region, context).await;
+    // skip_pull_data=true: called from forwarder which already holds the SERVERS lock.
+    register_mqtt_gateway(gateway_id, server, region, context, true).await;
 }
 
 /// Register a border gateway candidate for a virtual relay gateway.
@@ -1703,7 +1709,7 @@ async fn send_uplink_frame_to_backend(
                         gateways.get(&gateway_id).map(|info| (info.server.clone(), info.region.clone(), info.last_context.clone()))
                     };
                     if let Some((server, gw_region, context)) = gw_info {
-                        register_mqtt_gateway(virtual_gw, server, gw_region, context).await;
+                        register_mqtt_gateway(virtual_gw, server, gw_region, context, false).await;
                     }
                     info!(
                         server = %state.server,
