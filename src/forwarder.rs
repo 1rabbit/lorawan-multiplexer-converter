@@ -19,6 +19,8 @@ use crate::traits::PrintFullError;
 static SERVERS: OnceCell<RwLock<Vec<Server>>> = OnceCell::const_new();
 
 struct Server {
+    /// Optional configured output name (shown in logs). Empty = unnamed.
+    name: String,
     server: String,
     uplink_only: bool,
     gateway_id_prefixes: Vec<lrwn_filters::EuiPrefix>,
@@ -109,9 +111,18 @@ struct ServerSocket {
     pull_resp_token: Option<u16>,
 }
 
+/// A datagram queued for sending to a UDP server, prepared while the SERVERS
+/// lock is held and flushed afterwards without the lock.
+struct OutgoingDatagram {
+    socket: Arc<UdpSocket>,
+    server_name: String,
+    packet_type: PacketType,
+    data: Vec<u8>,
+}
+
 pub async fn setup(
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     outputs: Vec<config::GwmpOutput>,
 ) -> Result<()> {
     info!("Setting up forwarder");
@@ -126,6 +137,8 @@ pub async fn setup(
             dev_addr_deny: output.filters.dev_addr_deny.clone(),
             join_eui_prefixes: output.filters.join_eui_prefixes.clone(),
             join_eui_deny: output.filters.join_eui_deny.clone(),
+            input_name_allow: output.filters.input_name_allow.clone(),
+            input_name_deny: output.filters.input_name_deny.clone(),
         };
 
         // Validate relay prefix
@@ -152,6 +165,7 @@ pub async fn setup(
         };
 
         add_server(
+            output.name.clone(),
             output.server.clone(),
             output.uplink_only,
             output.gateway_id_prefixes.clone(),
@@ -174,15 +188,15 @@ pub async fn setup(
     Ok(())
 }
 
-async fn handle_uplink(mut uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>)>) {
-    while let Some((gateway_id, data, region, relay_id)) = uplink_rx.recv().await {
-        if let Err(e) = handle_uplink_packet(gateway_id, &data, &region, relay_id.as_deref()).await {
+async fn handle_uplink(mut uplink_rx: UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>, String)>) {
+    while let Some((gateway_id, data, region, relay_id, input_name)) = uplink_rx.recv().await {
+        if let Err(e) = handle_uplink_packet(gateway_id, &data, &region, relay_id.as_deref(), &input_name).await {
             error!(error = %e.full(), "Handle uplink error");
         }
     }
 }
 
-async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, relay_id: Option<&str>) -> Result<()> {
+async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, relay_id: Option<&str>, input_name: &str) -> Result<()> {
     let packet_type = PacketType::try_from(data)?;
     let random_token = get_random_token(data)?;
 
@@ -232,7 +246,7 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, 
     // Skip if this is an MQTT gateway - uplinks from MQTT-in are already forwarded directly
     if let Some(push_data) = &parsed_push_data {
         if mqtt::is_enabled().await && !mqtt::is_mqtt_gateway(gateway_id).await {
-            if let Err(e) = mqtt::send_uplink_frame(gateway_id, push_data, region, relay_id).await {
+            if let Err(e) = mqtt::send_uplink_frame(gateway_id, push_data, region, relay_id, input_name).await {
                 error!(error = %e, "MQTT send uplink error");
             }
             if let Some(stats) = push_data.to_gateway_stats() {
@@ -247,199 +261,238 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, 
     // Skip if this is a BS gateway - uplinks from BS-in are already forwarded
     if let Some(push_data) = &parsed_push_data {
         if basicstation::is_enabled().await && !basicstation::is_bs_gateway(gateway_id).await {
-            if let Err(e) = basicstation::send_uplink_frame(gateway_id, push_data, region).await {
+            if let Err(e) = basicstation::send_uplink_frame(gateway_id, push_data, region, input_name).await {
                 error!(error = %e, "BS send uplink error");
             }
         }
     }
 
-    let servers = SERVERS
-        .get_or_init(|| async { RwLock::new(Vec::new()) })
-        .await;
-    let mut servers = servers.write().await;
+    // Prepare datagrams while holding the SERVERS lock, then flush them after
+    // releasing it — holding the write lock across UDP sends stalls all
+    // forwarding if a single send blocks.
+    let mut outgoing: Vec<OutgoingDatagram> = Vec::new();
 
-    for server in servers.iter_mut() {
-        // Determine effective gateway_id for this server (relay rewriting)
-        let (effective_gw, is_relay) = if let Some(rid) = relay_id {
-            if !server.relay_gateway_id_prefix.is_empty() {
-                let virtual_hex = format!("{}{}", server.relay_gateway_id_prefix, rid);
-                match GatewayId::from_hex(&virtual_hex) {
-                    Ok(virtual_gw) => {
-                        // Register mapping for downlink routing (with signal quality for best-gateway selection)
-                        let (rssi, snr) = parsed_push_data.as_ref()
-                            .and_then(|pd| pd.payload.rxpk.first())
-                            .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
-                            .unwrap_or((0, 0.0));
-                        mqtt::register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
-                        // Register virtual gateway in MQTT_GATEWAYS for downlink routing back
-                        if let Some((srv, rgn, ctx)) = mqtt::get_mqtt_gateway_info(gateway_id).await {
-                            mqtt::register_mqtt_gateway_pub(virtual_gw, srv, rgn, ctx).await;
+    {
+        let servers = SERVERS
+            .get_or_init(|| async { RwLock::new(Vec::new()) })
+            .await;
+        let mut servers = servers.write().await;
+
+        for server in servers.iter_mut() {
+            // Determine effective gateway_id for this server (relay rewriting)
+            let (effective_gw, is_relay) = if let Some(rid) = relay_id {
+                if !server.relay_gateway_id_prefix.is_empty() {
+                    let virtual_hex = format!("{}{}", server.relay_gateway_id_prefix, rid);
+                    match GatewayId::from_hex(&virtual_hex) {
+                        Ok(virtual_gw) => {
+                            // Register mapping for downlink routing (with signal quality for best-gateway selection)
+                            let (rssi, snr) = parsed_push_data.as_ref()
+                                .and_then(|pd| pd.payload.rxpk.first())
+                                .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
+                                .unwrap_or((0, 0.0));
+                            mqtt::register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
+                            // Register virtual gateway in MQTT_GATEWAYS for downlink routing back
+                            if let Some((srv, rgn, ctx)) = mqtt::get_mqtt_gateway_info(gateway_id).await {
+                                mqtt::register_mqtt_gateway_pub(virtual_gw, srv, rgn, ctx).await;
+                            }
+                            info!(
+                                server = %server.server,
+                                border_gateway = %gateway_id,
+                                virtual_gateway = %virtual_gw,
+                                relay_id = %rid,
+                                "Rewriting gateway_id for mesh relay (UDP output)"
+                            );
+                            (virtual_gw, true)
                         }
-                        info!(
-                            server = %server.server,
-                            border_gateway = %gateway_id,
-                            virtual_gateway = %virtual_gw,
-                            relay_id = %rid,
-                            "Rewriting gateway_id for mesh relay (UDP output)"
-                        );
-                        (virtual_gw, true)
+                        Err(e) => {
+                            warn!(relay_id = %rid, error = %e, "Invalid virtual gateway ID, using original");
+                            (gateway_id, false)
+                        }
                     }
-                    Err(e) => {
-                        warn!(relay_id = %rid, error = %e, "Invalid virtual gateway ID, using original");
-                        (gateway_id, false)
-                    }
+                } else {
+                    (gateway_id, false)
                 }
             } else {
                 (gateway_id, false)
+            };
+
+            if !server.match_gateway_id(effective_gw) {
+                continue;
             }
-        } else {
-            (gateway_id, false)
-        };
 
-        if !server.match_gateway_id(effective_gw) {
-            continue;
-        }
+            // Drop uplinks from inputs this server denies by name.
+            if !server.allow_deny_filters.matches_input_name(input_name) {
+                debug!(server = %server.server, input_name = %input_name, "Dropping uplink, input name not permitted by filters");
+                continue;
+            }
 
-        // Clone filters before mutable borrow of socket.
-        let filters = server.filters.clone();
-        let allow_deny_filters = server.allow_deny_filters.clone();
-        let server_name = server.server.clone();
+            // Clone filters before mutable borrow of socket.
+            let filters = server.filters.clone();
+            let allow_deny_filters = server.allow_deny_filters.clone();
+            let server_name = server.server.clone();
+            // Message prefix with the output name when configured, e.g. "[ttn] ".
+            let name_prefix = if server.name.is_empty() {
+                String::new()
+            } else {
+                format!("[{}] ", server.name)
+            };
 
-        let socket = server.get_server_socket(effective_gw).await?;
-        socket.last_uplink = SystemTime::now();
+            let socket_entry = server.get_server_socket(effective_gw).await?;
+            socket_entry.last_uplink = SystemTime::now();
+            let socket = socket_entry.socket.clone();
 
-        let span = tracing::info_span!("", addr = %socket.socket.peer_addr().unwrap());
-        let _enter = span.enter();
+            // For relay virtual gateways, send PULL_DATA before the uplink so the
+            // LNS knows where to route downlinks for this virtual MAC.
+            if is_relay {
+                let pull_data = PullData::new(&effective_gw);
+                debug!(gateway_id = %effective_gw, "{}Queueing PULL_DATA for virtual relay gateway", name_prefix);
+                socket_entry.pull_data_token = Some(pull_data.random_token);
+                outgoing.push(OutgoingDatagram {
+                    socket: socket.clone(),
+                    server_name: server_name.clone(),
+                    packet_type: PacketType::PullData,
+                    data: pull_data.to_bytes(),
+                });
+            }
 
-        // For relay virtual gateways, send PULL_DATA before the uplink so the
-        // LNS knows where to route downlinks for this virtual MAC.
-        if is_relay {
-            let pull_data = PullData::new(&effective_gw);
-            let pd_data = pull_data.to_bytes();
-            debug!(gateway_id = %effective_gw, "Sending PULL_DATA for virtual relay gateway");
-            socket.pull_data_token = Some(pull_data.random_token);
-            socket.socket.send(&pd_data).await.context("Send relay PULL_DATA")?;
-            inc_server_udp_sent_count(&server_name, PacketType::PullData).await;
-        }
+            match packet_type {
+                PacketType::PushData => {
+                    if let Some(push_data) = &parsed_push_data {
+                        let has_payload_filters = !allow_deny_filters.dev_addr_deny.is_empty()
+                            || !allow_deny_filters.join_eui_deny.is_empty()
+                            || !allow_deny_filters.dev_addr_prefixes.is_empty()
+                            || !allow_deny_filters.join_eui_prefixes.is_empty()
+                            || !filters.dev_addr_prefixes.is_empty()
+                            || !filters.join_eui_prefixes.is_empty();
 
-        match packet_type {
-            PacketType::PushData => {
-                if let Some(push_data) = &parsed_push_data {
-                    let has_payload_filters = !allow_deny_filters.dev_addr_deny.is_empty()
-                        || !allow_deny_filters.join_eui_deny.is_empty()
-                        || !allow_deny_filters.dev_addr_prefixes.is_empty()
-                        || !allow_deny_filters.join_eui_prefixes.is_empty()
-                        || !filters.dev_addr_prefixes.is_empty()
-                        || !filters.join_eui_prefixes.is_empty();
-
-                    if push_data.payload.rxpk.is_empty() {
-                        // Stat-only packet (no rxpk) — forward raw bytes regardless of filters.
-                        if !push_data.payload.is_empty() {
-                            if is_relay {
-                                // Must re-serialize with virtual gateway_id
-                                let mut rewritten = push_data.clone();
-                                rewritten.gateway_id = *effective_gw.as_bytes();
-                                let rewritten_data = rewritten.to_bytes();
-                                info!(gateway_id = %effective_gw, "Forwarding UDP stats (relay)");
-                                socket.push_data_token = Some(random_token);
-                                socket.socket.send(&rewritten_data).await.context("Send UDP packet")?;
+                        if push_data.payload.rxpk.is_empty() {
+                            // Stat-only packet (no rxpk) — forward raw bytes regardless of filters.
+                            if !push_data.payload.is_empty() {
+                                let out = if is_relay {
+                                    // Must re-serialize with virtual gateway_id
+                                    let mut rewritten = push_data.clone();
+                                    rewritten.gateway_id = *effective_gw.as_bytes();
+                                    info!(gateway_id = %effective_gw, "{}Forwarding UDP stats (relay)", name_prefix);
+                                    rewritten.to_bytes()
+                                } else {
+                                    info!(gateway_id = %effective_gw, "{}Forwarding UDP stats", name_prefix);
+                                    data.to_vec()
+                                };
+                                socket_entry.push_data_token = Some(random_token);
+                                outgoing.push(OutgoingDatagram {
+                                    socket, server_name, packet_type, data: out,
+                                });
                             } else {
-                                info!(gateway_id = %effective_gw, "Forwarding UDP stats");
-                                socket.push_data_token = Some(random_token);
-                                socket.socket.send(data).await.context("Send UDP packet")?;
+                                debug!("Nothing to send, UDP packet is empty");
                             }
-                            inc_server_udp_sent_count(&server_name, packet_type).await;
+                        } else if !has_payload_filters && !is_relay {
+                            // No payload filters and no relay rewrite — raw passthrough.
+                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "{}Forwarding UDP uplink", name_prefix);
+                            socket_entry.push_data_token = Some(random_token);
+                            outgoing.push(OutgoingDatagram {
+                                socket, server_name, packet_type, data: data.to_vec(),
+                            });
                         } else {
-                            debug!("Nothing to send, UDP packet is empty");
-                        }
-                    } else if !has_payload_filters && !is_relay {
-                        // No payload filters and no relay rewrite — raw passthrough.
-                        info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
-                        socket.push_data_token = Some(random_token);
-                        socket.socket.send(data).await.context("Send UDP packet")?;
-                        inc_server_udp_sent_count(&server_name, packet_type).await;
-                    } else {
-                        // Filters configured or relay rewrite needed — must process.
-                        let original_count = push_data.payload.rxpk.len();
-                        let mut filtered_push_data = push_data.clone();
+                            // Filters configured or relay rewrite needed — must process.
+                            let original_count = push_data.payload.rxpk.len();
+                            let mut filtered_push_data = push_data.clone();
 
-                        // Apply relay gateway_id rewrite and strip relay metadata
-                        if is_relay {
-                            filtered_push_data.gateway_id = *effective_gw.as_bytes();
-                            for rxpk in &mut filtered_push_data.payload.rxpk {
-                                if let Some(ref mut meta) = rxpk.meta {
-                                    meta.remove("relay_id");
-                                    meta.remove("hop_count");
-                                    if meta.is_empty() {
-                                        rxpk.meta = None;
+                            // Apply relay gateway_id rewrite and strip relay metadata
+                            if is_relay {
+                                filtered_push_data.gateway_id = *effective_gw.as_bytes();
+                                for rxpk in &mut filtered_push_data.payload.rxpk {
+                                    if let Some(ref mut meta) = rxpk.meta {
+                                        meta.remove("relay_id");
+                                        meta.remove("hop_count");
+                                        if meta.is_empty() {
+                                            rxpk.meta = None;
+                                        }
                                     }
                                 }
+                                debug!(server = %server_name, "Stripped relay metadata from uplink");
                             }
-                            debug!(server = %server_name, "Stripped relay metadata from uplink");
-                        }
 
-                        if !allow_deny_filters.dev_addr_deny.is_empty()
-                            || !allow_deny_filters.join_eui_deny.is_empty()
-                        {
-                            filtered_push_data
-                                .payload
-                                .filter_rxpk_allow_deny(&allow_deny_filters);
-                        } else if !filters.dev_addr_prefixes.is_empty()
-                            || !filters.join_eui_prefixes.is_empty()
-                        {
-                            filtered_push_data
-                                .payload
-                                .filter_rxpk(&filters);
-                        }
+                            if !allow_deny_filters.dev_addr_deny.is_empty()
+                                || !allow_deny_filters.join_eui_deny.is_empty()
+                            {
+                                filtered_push_data
+                                    .payload
+                                    .filter_rxpk_allow_deny(&allow_deny_filters);
+                            } else if !filters.dev_addr_prefixes.is_empty()
+                                || !filters.join_eui_prefixes.is_empty()
+                            {
+                                filtered_push_data
+                                    .payload
+                                    .filter_rxpk(&filters);
+                            }
 
-                        let remaining_count = filtered_push_data.payload.rxpk.len();
+                            let remaining_count = filtered_push_data.payload.rxpk.len();
 
-                        if remaining_count == 0 {
-                            // All rxpk removed — drop.
-                            debug!("Nothing to send, UDP packet does not match filters");
-                        } else if remaining_count == original_count && !is_relay {
-                            // All rxpk passed and no relay — send original raw bytes.
-                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
-                            socket.push_data_token = Some(random_token);
-                            socket.socket.send(data).await.context("Send UDP packet")?;
-                            inc_server_udp_sent_count(&server_name, packet_type).await;
-                        } else {
-                            // Re-serialize (filtered or relay-rewritten).
-                            let filtered_data = filtered_push_data.to_bytes();
-                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink (filtered)");
-                            socket.push_data_token = Some(random_token);
-                            socket.socket.send(&filtered_data).await.context("Send UDP packet")?;
-                            inc_server_udp_sent_count(&server_name, packet_type).await;
+                            if remaining_count == 0 {
+                                // All rxpk removed — drop.
+                                debug!("Nothing to send, UDP packet does not match filters");
+                            } else if remaining_count == original_count && !is_relay {
+                                // All rxpk passed and no relay — send original raw bytes.
+                                info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "{}Forwarding UDP uplink", name_prefix);
+                                socket_entry.push_data_token = Some(random_token);
+                                outgoing.push(OutgoingDatagram {
+                                    socket, server_name, packet_type, data: data.to_vec(),
+                                });
+                            } else {
+                                // Re-serialize (filtered or relay-rewritten).
+                                let filtered_data = filtered_push_data.to_bytes();
+                                info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "{}Forwarding UDP uplink (filtered)", name_prefix);
+                                socket_entry.push_data_token = Some(random_token);
+                                outgoing.push(OutgoingDatagram {
+                                    socket, server_name, packet_type, data: filtered_data,
+                                });
+                            }
                         }
                     }
                 }
-            }
-            PacketType::PullData => {
-                if is_relay {
-                    // Send PULL_DATA with virtual gateway_id
-                    let pull_data = PullData::new(&effective_gw);
-                    let pd_data = pull_data.to_bytes();
-                    info!(packet_type = %packet_type, gateway_id = %effective_gw, "Sending UDP packet (relay)");
-                    socket.pull_data_token = Some(pull_data.random_token);
-                    socket.socket.send(&pd_data).await.context("Send UDP packet")?;
-                } else {
-                    info!(packet_type = %packet_type, "Sending UDP packet");
-                    socket.pull_data_token = Some(random_token);
-                    socket.socket.send(data).await.context("Send UDP packet")?;
+                PacketType::PullData => {
+                    let out = if is_relay {
+                        // Send PULL_DATA with virtual gateway_id
+                        let pull_data = PullData::new(&effective_gw);
+                        info!(packet_type = %packet_type, gateway_id = %effective_gw, "{}Queueing UDP packet (relay)", name_prefix);
+                        socket_entry.pull_data_token = Some(pull_data.random_token);
+                        pull_data.to_bytes()
+                    } else {
+                        info!(packet_type = %packet_type, "{}Queueing UDP packet", name_prefix);
+                        socket_entry.pull_data_token = Some(random_token);
+                        data.to_vec()
+                    };
+                    outgoing.push(OutgoingDatagram {
+                        socket, server_name, packet_type, data: out,
+                    });
                 }
-                inc_server_udp_sent_count(&server_name, packet_type).await;
-            }
-            PacketType::TxAck => {
-                if let Some(pull_resp_token) = socket.pull_resp_token
-                    && pull_resp_token == random_token
-                {
-                    info!(packet_type = %packet_type, "Sending UDP packet");
-                    socket.pull_resp_token = None;
-                    socket.socket.send(data).await.context("Send UDP packet")?;
-                    inc_server_udp_sent_count(&server_name, packet_type).await;
+                PacketType::TxAck => {
+                    if let Some(pull_resp_token) = socket_entry.pull_resp_token
+                        && pull_resp_token == random_token
+                    {
+                        info!(packet_type = %packet_type, "{}Queueing UDP packet", name_prefix);
+                        socket_entry.pull_resp_token = None;
+                        outgoing.push(OutgoingDatagram {
+                            socket, server_name, packet_type, data: data.to_vec(),
+                        });
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+    } // SERVERS write lock released here.
+
+    // Flush queued datagrams without holding the SERVERS lock, so a slow or
+    // blocked send never stalls uplink processing for other gateways.
+    for out in outgoing {
+        match out.socket.send(&out.data).await {
+            Ok(_) => inc_server_udp_sent_count(&out.server_name, out.packet_type).await,
+            Err(e) => error!(
+                server = %out.server_name,
+                packet_type = %out.packet_type,
+                error = %e,
+                "Failed to send UDP packet"
+            ),
         }
     }
 
@@ -547,6 +600,7 @@ async fn handle_pull_resp(
 }
 
 async fn add_server(
+    name: String,
     server: String,
     uplink_only: bool,
     gateway_id_prefixes: Vec<lrwn_filters::EuiPrefix>,
@@ -557,6 +611,7 @@ async fn add_server(
     relay_gateway_id_prefix: String,
 ) -> Result<()> {
     info!(
+        name = %name,
         server = server,
         uplink_only = uplink_only,
         gateway_id_prefixes = ?gateway_id_prefixes,
@@ -570,6 +625,7 @@ async fn add_server(
 
     let mut servers = servers.write().await;
     servers.push(Server {
+        name,
         server,
         uplink_only,
         gateway_id_prefixes,
@@ -648,6 +704,11 @@ pub async fn send_pull_data_for_gateway(gateway_id: GatewayId) -> Result<()> {
         let data = pull_data.to_bytes();
         let token = pull_data.random_token;
         let server_name = server.server.clone();
+        let name_prefix = if server.name.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", server.name)
+        };
 
         // Get or create socket for this gateway
         let socket = server.get_server_socket(gateway_id).await?;
@@ -656,7 +717,7 @@ pub async fn send_pull_data_for_gateway(gateway_id: GatewayId) -> Result<()> {
             gateway_id = %gateway_id,
             server = %server_name,
             token = token,
-            "Sending synthetic PULL_DATA for MQTT-in gateway"
+            "{}Sending synthetic PULL_DATA for MQTT-in gateway", name_prefix
         );
 
         socket.pull_data_token = Some(token);

@@ -16,6 +16,7 @@ but substantially rewritten and extended.
 - **Protocol conversion**: UDP↔MQTT↔Basic Station in any direction simultaneously
 - **Mesh relay virtualization**: Make ChirpStack mesh relays appear as independent gateways to any LNS. Configurable per output with a gateway ID prefix
 - **Allow/deny filtering**: Gateway ID, DevAddr, and JoinEUI prefix filters with explicit deny lists on every output. Deny takes precedence
+- **Named inputs/outputs**: Give any input or output an optional `name` (shown in logs). Outputs can filter uplinks by originating input name via `input_name_allow` / `input_name_deny`
 - **Analyzer mode**: Passive MQTT output that receives all traffic (including `application/#`) without affecting routing
 - **Environment variable substitution**: `$ENV_VAR` in config values
 - **Prometheus metrics**: `/metrics` endpoint for all backends
@@ -65,20 +66,32 @@ See [`config.toml.example`](config.toml.example) for the full annotated referenc
 [gwmp]
 
   [[gwmp.input]]
+    name = "openlns"         # optional label (shown in logs, referenced by input_name_deny)
     bind = "0.0.0.0:1700"
     topic_prefix = "eu868"   # used as MQTT topic prefix
 
   [[gwmp.output]]
+    name = ""                 # optional label (shown in logs)
     server = "example.com:1700"
     uplink_only = false
-    gateway_id_prefixes = []  # allow list (empty = all)
+    gateway_id_allow = []     # allow list (empty = all)
     gateway_id_deny = []      # deny list (takes precedence)
-    [gwmp.output.filters]
-      dev_addr_prefixes = []
-      dev_addr_deny = []
-      join_eui_prefixes = []
-      join_eui_deny = []
+    # Filters live directly on the output.
+    dev_addr_allow = []
+    dev_addr_deny = []
+    join_eui_allow = []
+    join_eui_deny = []
+    input_name_allow = []     # if set, only forward uplinks from these inputs
+    input_name_deny = []      # drop uplinks from these inputs (takes precedence)
 ```
+
+> **Allow-list field names:** `*_allow` (`gateway_id_allow`, `dev_addr_allow`, `join_eui_allow`)
+> is the preferred spelling; the older `*_prefixes` names are still accepted as aliases. Don't
+> set both spellings for the same field.
+>
+> **Filter placement:** Filter fields are set directly on the input/output. The older nested
+> `[gwmp.output.filters]` table form is still accepted for backwards compatibility and takes
+> precedence when present.
 
 ### MQTT
 
@@ -87,12 +100,14 @@ See [`config.toml.example`](config.toml.example) for the full annotated referenc
 
   # Subscribe to uplinks from a broker (MQTT input).
   [[mqtt.input]]
+    name = ""                # optional label (shown in logs)
     server = "tcp://localhost:1883"
     username = ""
     password = ""
 
   # Publish uplinks, subscribe to downlinks (MQTT output).
   [[mqtt.output]]
+    name = ""                # optional label (shown in logs)
     server = "tcp://localhost:1883"
     uplink_only = false
 
@@ -113,11 +128,13 @@ See [`config.toml.example`](config.toml.example) for the full annotated referenc
     # injects anything back into the network.
     analyzer = false
 
-    [mqtt.output.filters]
-      dev_addr_prefixes = []
-      dev_addr_deny = []
-      join_eui_prefixes = []
-      join_eui_deny = []
+    # Filters live directly on the output.
+    dev_addr_allow = []
+    dev_addr_deny = []
+    join_eui_allow = []
+    join_eui_deny = []
+    input_name_allow = []     # if set, only forward uplinks from these inputs
+    input_name_deny = []      # drop uplinks from these inputs (takes precedence)
 ```
 
 **Typical analyzer setup:**
@@ -151,6 +168,7 @@ Docker Compose setup for spinning up multiple Mosquitto brokers with isolated cr
 
   # Accept connections from Basic Station gateways.
   [[basics.input]]
+    name = ""                # optional label (shown in logs)
     bind = "0.0.0.0:3001"
     topic_prefix = "eu868"
     [basics.input.router_config]
@@ -161,11 +179,14 @@ Docker Compose setup for spinning up multiple Mosquitto brokers with isolated cr
 
   # Connect to a Basic Station LNS as a client.
   [[basics.output]]
+    name = ""                # optional label (shown in logs)
     server = "wss://lns.example.com:3001"
     # gateway_tokens = { "0016c001f184aa22" = "Authorization: Bearer ..." }
-    [basics.output.filters]
-      dev_addr_prefixes = []
-      dev_addr_deny = []
+    # Filters live directly on the output.
+    dev_addr_allow = []
+    dev_addr_deny = []
+    input_name_allow = []     # if set, only forward uplinks from these inputs
+    input_name_deny = []      # drop uplinks from these inputs (takes precedence)
 ```
 
 ### Mesh relay virtualization
@@ -177,8 +198,8 @@ is carried in the protobuf `rx_info.metadata["relay_id"]` field of each uplink.
 ChirpStack natively understands this metadata, but other LNS platforms only see the border gateway.
 With `relay_gateway_id_prefix`, each mesh relay appears as its own gateway:
 
-- **Uplink**: The multiplexer detects `relay_id` in MQTT-in uplinks and replaces the gateway ID with
-  `prefix + relay_id` on outputs that have the prefix configured
+- **Uplink**: The multiplexer detects `relay_id` in incoming uplinks and replaces the gateway ID with
+  `prefix + relay_id` on outputs (GWMP, MQTT, or Basic Station) that have the prefix configured
 - **Downlink**: Downlinks targeting a virtual gateway are routed back through the original border gateway
 
 The prefix is configured **per output**, so you can choose which outputs see virtual gateways.
@@ -204,12 +225,45 @@ Outputs without a prefix pass traffic through unchanged with the border gateway 
 
 ### Allow/Deny filter logic
 
-| `*_prefixes` (allow) | `*_deny` | Result |
+The allow list is `*_allow` (aliased: `*_prefixes`); the deny list is `*_deny`.
+
+| `*_allow` (allow) | `*_deny` | Result |
 |---|---|---|
 | `[]` | `[]` | Pass everything |
 | `["01000000/8"]` | `[]` | Only matching prefix |
 | `[]` | `["01020304/32"]` | Everything except denied |
 | `["01000000/8"]` | `["01020304/32"]` | Prefix, minus denied |
+
+### Filtering by input name
+
+Give an input a `name`, then reference it in an output's `input_name_allow` /
+`input_name_deny` to control which inputs' uplinks reach that output. They follow the same
+allow/deny logic as the other filters — deny takes precedence, and a non-empty allow list
+restricts to matching names.
+
+```toml
+[[gwmp.input]]
+  name = "openlns"
+  bind = "0.0.0.0:1700"
+
+[[gwmp.output]]
+  server = "gateway.openlns.com:1782"
+  input_name_deny = ["openlns"]   # don't send openlns's own uplinks back to it
+
+[[gwmp.output]]
+  server = "trusted-lns.example.com:1700"
+  input_name_allow = ["helium"]   # only forward uplinks from the "helium" input
+```
+
+| `input_name_allow` | `input_name_deny` | Result for a named input |
+|---|---|---|
+| `[]` | `[]` | All named inputs pass |
+| `["a"]` | `[]` | Only input `a` passes |
+| `[]` | `["a"]` | All except input `a` pass |
+| `["a"]` | `["a"]` | `a` denied (deny wins) |
+
+Unnamed inputs (empty `name`) pass when only a deny list is set, but are **rejected** when an
+`input_name_allow` list is configured — an explicit allow list requires a matching name.
 
 ### Monitoring
 

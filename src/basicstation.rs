@@ -65,6 +65,9 @@ struct PendingDntxed {
 }
 
 struct OutputState {
+    /// Optional configured output name (shown in logs). Empty = unnamed.
+    #[allow(dead_code)]
+    name: String,
     server: String,
     #[allow(dead_code)]
     uplink_only: bool,
@@ -238,7 +241,7 @@ struct GenericMessage {
 pub async fn setup(
     config: &config::BasicsConfig,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
 ) -> Result<()> {
     BS_GATEWAYS
         .get_or_init(|| async { RwLock::new(HashMap::new()) })
@@ -310,6 +313,7 @@ pub async fn send_uplink_frame(
     gateway_id: GatewayId,
     push_data: &PushData,
     region: &str,
+    input_name: &str,
 ) -> Result<()> {
     let states = match STATES.get() {
         Some(s) => s,
@@ -324,6 +328,12 @@ pub async fn send_uplink_frame(
     let data = push_data.to_bytes();
 
     for state in states.iter() {
+        // Drop uplinks from inputs this output denies by name.
+        if !state.allow_deny_filters.matches_input_name(input_name) {
+            debug!(server = %state.server, input_name = %input_name, "Dropping BS uplink, input name not permitted by filters");
+            continue;
+        }
+
         // When gateway_tokens is non-empty, it acts as an implicit allow list.
         if !state.gateway_tokens.is_empty() && !state.gateway_tokens.contains_key(&gateway_id) {
             continue;
@@ -463,11 +473,16 @@ pub async fn send_tx_ack(
 async fn setup_input(
     conf: &config::BasicsInput,
     _downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
 ) -> Result<()> {
-    info!(bind = %conf.bind, topic_prefix = %conf.topic_prefix, "Setting up Basic Station input");
+    if conf.name.is_empty() {
+        info!(bind = %conf.bind, topic_prefix = %conf.topic_prefix, "Setting up Basic Station input");
+    } else {
+        info!(bind = %conf.bind, topic_prefix = %conf.topic_prefix, name = %conf.name, "Setting up Basic Station input");
+    }
 
     let region = conf.topic_prefix.clone();
+    let input_name = conf.name.clone();
     let router_config = conf.router_config.clone();
     let dr_table = conf.router_config.drs.clone();
     let ping_interval = conf.ping_interval;
@@ -481,6 +496,8 @@ async fn setup_input(
         dev_addr_deny: conf.filters.dev_addr_deny.clone(),
         join_eui_prefixes: conf.filters.join_eui_prefixes.clone(),
         join_eui_deny: conf.filters.join_eui_deny.clone(),
+        input_name_allow: conf.filters.input_name_allow.clone(),
+        input_name_deny: conf.filters.input_name_deny.clone(),
     };
 
     let app = Router::new()
@@ -504,6 +521,7 @@ async fn setup_input(
             "/gateway/{gateway_id}",
             any({
                 let region = region.clone();
+                let input_name = input_name.clone();
                 let router_config = router_config.clone();
                 let dr_table = dr_table.clone();
                 let uplink_tx = uplink_tx.clone();
@@ -513,6 +531,7 @@ async fn setup_input(
                 let allow_deny_filters = allow_deny_filters.clone();
                 move |Path(gw_id): Path<String>, ws: WebSocketUpgrade| {
                     let region = region.clone();
+                    let input_name = input_name.clone();
                     let router_config = router_config.clone();
                     let dr_table = dr_table.clone();
                     let uplink_tx = uplink_tx.clone();
@@ -524,6 +543,7 @@ async fn setup_input(
                                 socket,
                                 gw_id,
                                 region,
+                                input_name,
                                 router_config,
                                 dr_table,
                                 uplink_tx,
@@ -587,9 +607,10 @@ async fn handle_gateway_ws(
     socket: WebSocket,
     gw_id_str: String,
     region: String,
+    input_name: String,
     router_config: config::RouterConfig,
     dr_table: Vec<[i32; 3]>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     ping_interval: Duration,
     read_timeout: Duration,
     gateway_id_filters: GatewayIdFilters,
@@ -706,6 +727,7 @@ async fn handle_gateway_ws(
                             gateway_id,
                             &text,
                             &region,
+                            &input_name,
                             &dr_table,
                             &uplink_tx,
                             &mut ws_sink,
@@ -763,8 +785,9 @@ async fn handle_bs_message(
     gateway_id: GatewayId,
     text: &str,
     region: &str,
+    input_name: &str,
     dr_table: &[[i32; 3]],
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     ws_sink: &mut futures_util::stream::SplitSink<WebSocket, AxumMessage>,
     allow_deny_filters: &AllowDenyFilters,
 ) -> Result<()> {
@@ -775,12 +798,12 @@ async fn handle_bs_message(
         "updf" => {
             let updf: UplinkDataFrame =
                 serde_json::from_str(text).context("Parse updf")?;
-            handle_updf(gateway_id, updf, text, region, dr_table, uplink_tx, allow_deny_filters).await?;
+            handle_updf(gateway_id, updf, text, region, input_name, dr_table, uplink_tx, allow_deny_filters).await?;
         }
         "jreq" => {
             let jreq: JoinRequest =
                 serde_json::from_str(text).context("Parse jreq")?;
-            handle_jreq(gateway_id, jreq, text, region, dr_table, uplink_tx, allow_deny_filters).await?;
+            handle_jreq(gateway_id, jreq, text, region, input_name, dr_table, uplink_tx, allow_deny_filters).await?;
         }
         "dntxed" => {
             let dntxed: DownlinkTransmitted =
@@ -818,8 +841,9 @@ async fn handle_updf(
     updf: UplinkDataFrame,
     original_text: &str,
     region: &str,
+    input_name: &str,
     dr_table: &[[i32; 3]],
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     allow_deny_filters: &AllowDenyFilters,
 ) -> Result<()> {
     // Update last xtime/rctx.
@@ -856,13 +880,18 @@ async fn handle_updf(
         updf.dev_addr & 0xFF,
     );
 
+    let name_prefix = if input_name.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", input_name)
+    };
     info!(
         gateway_id = %gateway_id,
         dev_addr = %dev_addr,
         f_port = updf.fport,
         dr = updf.dr,
         freq = updf.freq,
-        "Received BS updf"
+        "{}Received BS updf", name_prefix,
     );
 
     // BS→BS passthrough: forward original JSON directly to BS outputs.
@@ -875,7 +904,7 @@ async fn handle_updf(
     let data = push_data.to_bytes();
 
     uplink_tx
-        .send((gateway_id, data, region.to_string(), None))
+        .send((gateway_id, data, region.to_string(), None, input_name.to_string()))
         .context("Uplink channel send")?;
 
     Ok(())
@@ -886,8 +915,9 @@ async fn handle_jreq(
     jreq: JoinRequest,
     original_text: &str,
     region: &str,
+    input_name: &str,
     dr_table: &[[i32; 3]],
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     allow_deny_filters: &AllowDenyFilters,
 ) -> Result<()> {
     // Update last xtime/rctx.
@@ -914,13 +944,18 @@ async fn handle_jreq(
         }
     }
 
+    let name_prefix = if input_name.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", input_name)
+    };
     info!(
         gateway_id = %gateway_id,
         join_eui = format!("{:016x}", jreq.join_eui),
         dev_eui = format!("{:016x}", jreq.dev_eui),
         dr = jreq.dr,
         freq = jreq.freq,
-        "Received BS jreq"
+        "{}Received BS jreq", name_prefix,
     );
 
     // BS→BS passthrough: forward original JSON directly to BS outputs.
@@ -933,7 +968,7 @@ async fn handle_jreq(
     let data = push_data.to_bytes();
 
     uplink_tx
-        .send((gateway_id, data, region.to_string(), None))
+        .send((gateway_id, data, region.to_string(), None, input_name.to_string()))
         .context("Uplink channel send")?;
 
     Ok(())
@@ -1199,7 +1234,11 @@ async fn setup_output(
     conf: &config::BasicsOutput,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
 ) -> Result<()> {
-    info!(server = %conf.server, "Setting up Basic Station output");
+    if conf.name.is_empty() {
+        info!(server = %conf.server, "Setting up Basic Station output");
+    } else {
+        info!(server = %conf.server, name = %conf.name, "Setting up Basic Station output");
+    }
 
     let gateway_id_filters = GatewayIdFilters {
         allow: conf.gateway_id_prefixes.clone(),
@@ -1210,6 +1249,8 @@ async fn setup_output(
         dev_addr_deny: conf.filters.dev_addr_deny.clone(),
         join_eui_prefixes: conf.filters.join_eui_prefixes.clone(),
         join_eui_deny: conf.filters.join_eui_deny.clone(),
+        input_name_allow: conf.filters.input_name_allow.clone(),
+        input_name_deny: conf.filters.input_name_deny.clone(),
     };
 
     // Parse gateway_tokens hex keys into GatewayId values.
@@ -1239,6 +1280,7 @@ async fn setup_output(
         let mut states = states.write().await;
         state_index = states.len();
         states.push(OutputState {
+            name: conf.name.clone(),
             server: conf.server.clone(),
             uplink_only: conf.uplink_only,
             gateway_id_filters,

@@ -31,20 +31,25 @@ pub async fn setup(
     inputs: &[config::GwmpInput],
 ) -> Result<(
     UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,  // downlink_tx (gateway_id, data, downlink_id)
-    UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>)>, // uplink_rx (gateway_id, data, region)
-    UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,  // uplink_tx (for MQTT-in)
+    UnboundedReceiver<(GatewayId, Vec<u8>, String, Option<String>, String)>, // uplink_rx (gateway_id, data, region)
+    UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,  // uplink_tx (for MQTT-in)
 )> {
-    let (uplink_tx, uplink_rx) = unbounded_channel::<(GatewayId, Vec<u8>, String, Option<String>)>();
+    let (uplink_tx, uplink_rx) = unbounded_channel::<(GatewayId, Vec<u8>, String, Option<String>, String)>();
     let (downlink_tx, downlink_rx) = unbounded_channel::<(GatewayId, Vec<u8>, Option<u32>)>();
 
     for input in inputs {
-        info!(bind = %input.bind, topic_prefix = %input.topic_prefix, "Setting up listener");
+        if input.name.is_empty() {
+            info!(bind = %input.bind, topic_prefix = %input.topic_prefix, "Setting up listener");
+        } else {
+            info!(bind = %input.bind, topic_prefix = %input.topic_prefix, name = %input.name, "Setting up listener");
+        }
 
         let sock = UdpSocket::bind(&input.bind).await.context("Bind socket")?;
         let sock = Arc::new(sock);
 
         let topic_prefix = input.topic_prefix.clone();
-        tokio::spawn(handle_uplink(sock.clone(), uplink_tx.clone(), topic_prefix));
+        let input_name = input.name.clone();
+        tokio::spawn(handle_uplink(sock.clone(), uplink_tx.clone(), topic_prefix, input_name));
     }
 
     tokio::spawn(handle_downlink(downlink_rx));
@@ -53,7 +58,7 @@ pub async fn setup(
     Ok((downlink_tx, uplink_rx, uplink_tx))
 }
 
-async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>, topic_prefix: String) {
+async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>, topic_prefix: String, input_name: String) {
     let mut buffer: [u8; 65535] = [0; 65535];
     loop {
         let (size, addr) = match socket.recv_from(&mut buffer).await {
@@ -69,7 +74,7 @@ async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(Gatew
             continue;
         }
 
-        if let Err(e) = handle_uplink_packet(&socket, &uplink_tx, addr, &buffer[..size], &topic_prefix)
+        if let Err(e) = handle_uplink_packet(&socket, &uplink_tx, addr, &buffer[..size], &topic_prefix, &input_name)
             .instrument(tracing::info_span!("", addr = %addr))
             .await
         {
@@ -80,10 +85,11 @@ async fn handle_uplink(socket: Arc<UdpSocket>, uplink_tx: UnboundedSender<(Gatew
 
 async fn handle_uplink_packet(
     socket: &Arc<UdpSocket>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     addr: SocketAddr,
     data: &[u8],
     topic_prefix: &str,
+    input_name: &str,
 ) -> Result<()> {
     let packet_type = PacketType::try_from(data)?;
     let gateway_id = GatewayId::try_from(data)?;
@@ -104,29 +110,36 @@ async fn handle_uplink_packet(
         None
     };
 
+    // Prefix the message with the input name when one is configured, e.g.
+    // "[openlns] Received UDP uplink". Unnamed inputs get no prefix.
+    let name_prefix = if input_name.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", input_name)
+    };
     if let Some(ref frames) = frame_info {
         info!(
             gateway_id = %gateway_id,
             frames = %frames,
-            "Received UDP uplink",
+            "{}Received UDP uplink", name_prefix,
         );
     } else {
         info!(
             packet_type = %packet_type,
             gateway_id = %gateway_id,
-            "Received UDP packet",
+            "{}Received UDP packet", name_prefix,
         );
     }
 
     inc_gateway_udp_received_count(gateway_id, packet_type).await;
 
     match packet_type {
-        PacketType::PushData => handle_push_data(socket, uplink_tx, addr, gateway_id, data, topic_prefix).await?,
+        PacketType::PushData => handle_push_data(socket, uplink_tx, addr, gateway_id, data, topic_prefix, input_name).await?,
         PacketType::PullData => {
             set_gateway(gateway_id, addr, socket.clone()).await?;
-            handle_pull_data(socket, uplink_tx, addr, gateway_id, data, topic_prefix).await?;
+            handle_pull_data(socket, uplink_tx, addr, gateway_id, data, topic_prefix, input_name).await?;
         }
-        PacketType::TxAck => handle_tx_ack(uplink_tx, gateway_id, data, topic_prefix).await?,
+        PacketType::TxAck => handle_tx_ack(uplink_tx, gateway_id, data, topic_prefix, input_name).await?,
         _ => warn!(packet_type = %packet_type, "Unexpected packet-type"),
     }
 
@@ -207,11 +220,12 @@ async fn handle_downlink_packet(
 
 async fn handle_push_data(
     socket: &Arc<UdpSocket>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     addr: SocketAddr,
     gateway_id: GatewayId,
     data: &[u8],
     topic_prefix: &str,
+    input_name: &str,
 ) -> Result<()> {
     if data.len() < 12 {
         return Err(anyhow!("At least 12 bytes are expected"));
@@ -225,21 +239,22 @@ async fn handle_push_data(
 
     debug!("Sending received data to uplink channel");
     uplink_tx
-        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None))
+        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None, input_name.to_string()))
         .context("Uplink channel send")?;
 
     Ok(())
 }
 
 async fn handle_tx_ack(
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     gateway_id: GatewayId,
     data: &[u8],
     topic_prefix: &str,
+    input_name: &str,
 ) -> Result<()> {
     // Forward to UDP servers via uplink channel
     uplink_tx
-        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None))
+        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None, input_name.to_string()))
         .context("Uplink channel send")?;
 
     // Forward to MQTT backends if enabled
@@ -291,11 +306,12 @@ async fn handle_tx_ack(
 
 async fn handle_pull_data(
     socket: &Arc<UdpSocket>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     addr: SocketAddr,
     gateway_id: GatewayId,
     data: &[u8],
     topic_prefix: &str,
+    input_name: &str,
 ) -> Result<()> {
     if data.len() < 12 {
         return Err(anyhow!("At least 12 bytes are expected"));
@@ -308,7 +324,7 @@ async fn handle_pull_data(
     inc_gateway_udp_sent_count(gateway_id, PacketType::PullAck).await;
 
     uplink_tx
-        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None))
+        .send((gateway_id, data.to_vec(), topic_prefix.to_string(), None, input_name.to_string()))
         .context("Uplink channel send")?;
 
     Ok(())

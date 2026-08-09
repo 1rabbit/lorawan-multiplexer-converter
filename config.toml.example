@@ -25,8 +25,12 @@
   # a topic_prefix (region). Multiple inputs can be configured for
   # different regions.
   #
+  # An optional "name" identifies the input in logs and can be referenced
+  # by an output's "input_name_deny" filter to drop uplinks from this input.
+  #
   # Example:
   # [[gwmp.input]]
+  #   name="openlns"
   #   bind="0.0.0.0:1700"
   #   topic_prefix="eu868"
 
@@ -34,6 +38,9 @@
   #
   # Example configuration:
   # [[gwmp.output]]
+  #
+  #   # Optional name (shown in logs).
+  #   name=""
   #
   #   # Hostname:port of the server.
   #   server="example.com:1700"
@@ -48,10 +55,13 @@
   #   # If not set, data of all gateways will be forwarded. If set, only data
   #   # from gateways with a matching Gateway ID will be forwarded.
   #   #
+  #   # `gateway_id_allow` is the preferred name; `gateway_id_prefixes` is a
+  #   # deprecated alias. Don't set both.
+  #   #
   #   # Example:
   #   # * "0102030405060708/64": Exact match (all 64 bits of the filter must match)
   #   # * "0102030400000000/32": All gateway IDs starting with "01020304" (filter on 32 most significant bits)
-  #   gateway_id_prefixes=[]
+  #   gateway_id_allow=[]
   #
   #   # Gateway ID deny list.
   #   #
@@ -68,41 +78,62 @@
   #   relay_gateway_id_prefix=""
   #
   #   # Filter configuration.
-  #   [gwmp.output.filters]
+  #   #
+  #   # Filter fields are set directly on the output. The older nested
+  #   # `[gwmp.output.filters]` table form is still accepted for backwards
+  #   # compatibility and takes precedence when present.
+  #   #
+  #   # Allow lists use `*_allow` (preferred). The `*_prefixes` names are
+  #   # deprecated aliases kept for backwards compatibility; don't set both.
   #
-  #     # DevAddr prefix filters (allow list).
-  #     #
-  #     # Example configuration:
-  #     # dev_addr_prefixes=["0000ff00/24"]
-  #     #
-  #     # The above filter means that the 24MSB of 0000ff00 will be used to
-  #     # filter DevAddrs. Uplinks with DevAddrs that do not match any of the
-  #     # configured filters will not be forwarded. Leaving this option empty
-  #     # disables filtering on DevAddr.
-  #     dev_addr_prefixes=[]
+  #   # DevAddr allow list.
+  #   #
+  #   # Example configuration:
+  #   # dev_addr_allow=["0000ff00/24"]
+  #   #
+  #   # The above filter means that the 24MSB of 0000ff00 will be used to
+  #   # filter DevAddrs. Uplinks with DevAddrs that do not match any of the
+  #   # configured filters will not be forwarded. Leaving this option empty
+  #   # disables filtering on DevAddr.
+  #   dev_addr_allow=[]
   #
-  #     # DevAddr deny list.
-  #     #
-  #     # If set, uplinks with DevAddrs matching any prefix will be rejected.
-  #     # Deny takes precedence over allow.
-  #     dev_addr_deny=[]
+  #   # DevAddr deny list.
+  #   #
+  #   # If set, uplinks with DevAddrs matching any prefix will be rejected.
+  #   # Deny takes precedence over allow.
+  #   dev_addr_deny=[]
   #
-  #     # JoinEUI prefix filters (allow list).
-  #     #
-  #     # Example configuration:
-  #     # join_eui_prefixes=["0000ff0000000000/24"]
-  #     #
-  #     # The above filter means that the 24MSB of 0000ff0000000000 will be used
-  #     # to filter JoinEUIs. Uplinks with JoinEUIs that do not match any of the
-  #     # configured filters will not be forwarded. Leaving this option empty
-  #     # disables filtering on JoinEUI.
-  #     join_eui_prefixes=[]
+  #   # JoinEUI allow list.
+  #   #
+  #   # Example configuration:
+  #   # join_eui_allow=["0000ff0000000000/24"]
+  #   #
+  #   # The above filter means that the 24MSB of 0000ff0000000000 will be used
+  #   # to filter JoinEUIs. Uplinks with JoinEUIs that do not match any of the
+  #   # configured filters will not be forwarded. Leaving this option empty
+  #   # disables filtering on JoinEUI.
+  #   join_eui_allow=[]
   #
-  #     # JoinEUI deny list.
-  #     #
-  #     # If set, join requests with JoinEUIs matching any prefix will be rejected.
-  #     # Deny takes precedence over allow.
-  #     join_eui_deny=[]
+  #   # JoinEUI deny list.
+  #   #
+  #   # If set, join requests with JoinEUIs matching any prefix will be rejected.
+  #   # Deny takes precedence over allow.
+  #   join_eui_deny=[]
+  #
+  #   # Input name allow / deny lists.
+  #   #
+  #   # Filter uplinks by the "name" of the input they arrived on. Same
+  #   # allow/deny logic as the other filters: deny takes precedence, and a
+  #   # non-empty allow list restricts forwarding to matching input names.
+  #   #
+  #   # Unnamed inputs (empty name) pass a deny-only config, but are rejected
+  #   # when input_name_allow is set.
+  #   #
+  #   # Example:
+  #   # input_name_allow=["helium"]
+  #   # input_name_deny=["openlns", "zzzztest"]
+  #   input_name_allow=[]
+  #   input_name_deny=[]
 
 
 # MQTT backend configuration.
@@ -112,6 +143,9 @@
   #
   # Example configuration:
   # [[mqtt.input]]
+  #   # Optional name (shown in logs).
+  #   name=""
+  #
   #   # MQTT broker server address.
   #   server="tcp://localhost:1883"
   #
@@ -142,24 +176,28 @@
   #   # tls_cert=""
   #   # tls_key=""
   #
-  #   # Gateway ID prefix filters (allow list).
-  #   # gateway_id_prefixes=[]
+  #   # Gateway ID allow list (alias: gateway_id_prefixes).
+  #   # gateway_id_allow=[]
   #
   #   # Gateway ID deny list.
   #   # Deny takes precedence over allow.
   #   # gateway_id_deny=[]
   #
-  #   # Filter configuration.
-  #   [mqtt.input.filters]
-  #     dev_addr_prefixes=[]
-  #     dev_addr_deny=[]
-  #     join_eui_prefixes=[]
-  #     join_eui_deny=[]
+  #   # Filter configuration (set directly on the input; legacy nested
+  #   # [mqtt.input.filters] table still accepted). Allow lists use `*_allow`
+  #   # (aliases: `*_prefixes`).
+  #   # dev_addr_allow=[]
+  #   # dev_addr_deny=[]
+  #   # join_eui_allow=[]
+  #   # join_eui_deny=[]
 
   # MQTT outputs (publish uplinks to an MQTT broker, subscribe to downlinks).
   #
   # Example configuration:
   # [[mqtt.output]]
+  #   # Optional name (shown in logs).
+  #   name=""
+  #
   #   # MQTT broker server address.
   #   server="tcp://localhost:1883"
   #
@@ -199,8 +237,8 @@
   #   # Forward application-layer messages.
   #   forward_application=false
   #
-  #   # Gateway ID prefix filters (allow list).
-  #   # gateway_id_prefixes=[]
+  #   # Gateway ID allow list (alias: gateway_id_prefixes).
+  #   # gateway_id_allow=[]
   #
   #   # Gateway ID deny list.
   #   # Deny takes precedence over allow.
@@ -214,12 +252,18 @@
   #   # Downlinks to virtual gateways are routed back through the border gateway.
   #   relay_gateway_id_prefix="01337000"
   #
-  #   # Filter configuration.
-  #   [mqtt.output.filters]
-  #     dev_addr_prefixes=[]
-  #     dev_addr_deny=[]
-  #     join_eui_prefixes=[]
-  #     join_eui_deny=[]
+  #   # Filter configuration (set directly on the output; legacy nested
+  #   # [mqtt.output.filters] table still accepted). Allow lists use `*_allow`
+  #   # (aliases: `*_prefixes`).
+  #   # dev_addr_allow=[]
+  #   # dev_addr_deny=[]
+  #   # join_eui_allow=[]
+  #   # join_eui_deny=[]
+  #
+  #   # Filter uplinks by originating input name (same allow/deny logic as
+  #   # the other filters; deny wins, allow list restricts to matching names).
+  #   # input_name_allow=["helium"]
+  #   # input_name_deny=["openlns"]
 
 
 # Basic Station (WebSocket) configuration.
@@ -233,6 +277,9 @@
   #
   # Example configuration:
   # [[basics.input]]
+  #   # Optional name (shown in logs).
+  #   name = ""
+  #
   #   # Interface:port to bind the WebSocket server to.
   #   bind = "0.0.0.0:3001"
   #
@@ -253,8 +300,8 @@
   #   # tls_key = ""
   #   # ca_cert = ""
   #
-  #   # Gateway ID prefix filters (allow list).
-  #   # gateway_id_prefixes = []
+  #   # Gateway ID allow list (alias: gateway_id_prefixes).
+  #   # gateway_id_allow = []
   #
   #   # Gateway ID deny list.
   #   # gateway_id_deny = []
@@ -285,12 +332,13 @@
   #       [-1, 0, 0], [-1, 0, 0], [-1, 0, 0], [-1, 0, 0],
   #     ]
   #
-  #   # Filter configuration.
-  #   # [basics.input.filters]
-  #   #   dev_addr_prefixes = []
-  #   #   dev_addr_deny = []
-  #   #   join_eui_prefixes = []
-  #   #   join_eui_deny = []
+  #   # Filter configuration (set directly on the input; legacy nested
+  #   # [basics.input.filters] table still accepted). Allow lists use `*_allow`
+  #   # (aliases: `*_prefixes`).
+  #   # dev_addr_allow = []
+  #   # dev_addr_deny = []
+  #   # join_eui_allow = []
+  #   # join_eui_deny = []
 
   # Basic Station Output - Forward uplinks to a BS-speaking LNS.
   #
@@ -300,6 +348,9 @@
   #
   # Example configuration:
   # [[basics.output]]
+  #   # Optional name (shown in logs).
+  #   name = ""
+  #
   #   # WebSocket URL of the LNS.
   #   server = "wss://lns.example.com:3001"
   #
@@ -317,18 +368,24 @@
   #   # tls_key = ""
   #   # ca_cert = ""
   #
-  #   # Gateway ID prefix filters (allow list).
-  #   # gateway_id_prefixes = ["0016c001f184aa22/64"]
+  #   # Gateway ID allow list (alias: gateway_id_prefixes).
+  #   # gateway_id_allow = ["0016c001f184aa22/64"]
   #
   #   # Gateway ID deny list.
   #   # gateway_id_deny = []
   #
-  #   # Filter configuration.
-  #   # [basics.output.filters]
-  #   #   dev_addr_prefixes = []
-  #   #   dev_addr_deny = []
-  #   #   join_eui_prefixes = []
-  #   #   join_eui_deny = []
+  #   # Filter configuration (set directly on the output; legacy nested
+  #   # [basics.output.filters] table still accepted). Allow lists use `*_allow`
+  #   # (aliases: `*_prefixes`).
+  #   # dev_addr_allow = []
+  #   # dev_addr_deny = []
+  #   # join_eui_allow = []
+  #   # join_eui_deny = []
+  #
+  #   # Filter uplinks by originating input name (same allow/deny logic as
+  #   # the other filters; deny wins, allow list restricts to matching names).
+  #   # input_name_allow = ["helium"]
+  #   # input_name_deny = ["openlns"]
   #
   #   # Per-gateway authentication tokens.
   #   #
@@ -337,7 +394,7 @@
   #   # matching the Basic Station tc.key file convention.
   #   #
   #   # When non-empty, this also acts as an implicit allow list: only
-  #   # gateways present in the map are forwarded. The gateway_id_prefixes
+  #   # gateways present in the map are forwarded. The gateway_id_allow
   #   # and gateway_id_deny filters still apply on top.
   #   #
   #   # [basics.output.gateway_tokens]

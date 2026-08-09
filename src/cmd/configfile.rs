@@ -26,8 +26,13 @@ pub fn run(config: &Configuration) {
   # Each input binds to an interface:port and tags incoming packets with
   # a topic_prefix (region). Multiple inputs can be configured for
   # different regions.
+  #
+  # An optional "name" can be set to identify the input. This name is used in
+  # logs and can be referenced by an output's "input_name_deny" filter to drop
+  # uplinks originating from this input.
   {{#each gwmp.input}}
   [[gwmp.input]]
+    name="{{this.name}}"
     bind="{{this.bind}}"
     topic_prefix="{{this.topic_prefix}}"
   {{/each}}
@@ -50,10 +55,13 @@ pub fn run(config: &Configuration) {
   #   # If not set, data of all gateways will be forwarded. If set, only data
   #   # from gateways with a matching Gateway ID will be forwarded.
   #   #
+  #   # `gateway_id_allow` is the preferred name; `gateway_id_prefixes` is a
+  #   # deprecated alias. Don't set both.
+  #   #
   #   # Example:
   #   # * "0102030405060708/64": Exact match (all 64 bits of the filter must match)
   #   # * "0102030400000000/32": All gateway IDs starting with "01020304" (filter on 32 most significant bits)
-  #   gateway_id_prefixes=[]
+  #   gateway_id_allow=[]
 
   #   # Gateway ID deny list.
   #   #
@@ -61,48 +69,69 @@ pub fn run(config: &Configuration) {
   #   # Deny takes precedence over allow.
   #   gateway_id_deny=[]
   #
-  #   # Filter configuration.
-  #   [gwmp.output.filters]
+  #   # DevAddr / JoinEUI / input-name filters.
+  #   #
+  #   # These are configured directly on the output. (A legacy nested
+  #   # `[gwmp.output.filters]` table is still accepted for backwards
+  #   # compatibility and takes precedence when present.)
+  #   #
+  #   # Allow lists use `*_allow` (preferred); `*_prefixes` are deprecated
+  #   # aliases kept for backwards compatibility. Don't set both.
 
-  #     # DevAddr prefix filters (allow list).
-  #     #
-  #     # Example configuration:
-  #     # dev_addr_prefixes=["0000ff00/24"]
-  #     #
-  #     # The above filter means that the 24MSB of 0000ff00 will be used to
-  #     # filter DevAddrs. Uplinks with DevAddrs that do not match any of the
-  #     # configured filters will not be forwarded. Leaving this option empty
-  #     # disables filtering on DevAddr.
-  #     dev_addr_prefixes=[]
+  #   # DevAddr allow list.
+  #   #
+  #   # Example configuration:
+  #   # dev_addr_allow=["0000ff00/24"]
+  #   #
+  #   # The above filter means that the 24MSB of 0000ff00 will be used to
+  #   # filter DevAddrs. Uplinks with DevAddrs that do not match any of the
+  #   # configured filters will not be forwarded. Leaving this option empty
+  #   # disables filtering on DevAddr.
+  #   dev_addr_allow=[]
 
-  #     # DevAddr deny list.
-  #     #
-  #     # If set, uplinks with DevAddrs matching any prefix will be rejected.
-  #     # Deny takes precedence over allow.
-  #     dev_addr_deny=[]
+  #   # DevAddr deny list.
+  #   #
+  #   # If set, uplinks with DevAddrs matching any prefix will be rejected.
+  #   # Deny takes precedence over allow.
+  #   dev_addr_deny=[]
 
-  #     # JoinEUI prefix filters (allow list).
-  #     #
-  #     # Example configuration:
-  #     # join_eui_prefixes=["0000ff0000000000/24"]
-  #     #
-  #     # The above filter means that the 24MSB of 0000ff0000000000 will be used
-  #     # to filter JoinEUIs. Uplinks with JoinEUIs that do not match any of the
-  #     # configured filters will not be forwarded. Leaving this option empty
-  #     # disables filtering on JoinEUI.
-  #     join_eui_prefixes=[]
+  #   # JoinEUI allow list.
+  #   #
+  #   # Example configuration:
+  #   # join_eui_allow=["0000ff0000000000/24"]
+  #   #
+  #   # The above filter means that the 24MSB of 0000ff0000000000 will be used
+  #   # to filter JoinEUIs. Uplinks with JoinEUIs that do not match any of the
+  #   # configured filters will not be forwarded. Leaving this option empty
+  #   # disables filtering on JoinEUI.
+  #   join_eui_allow=[]
 
-  #     # JoinEUI deny list.
-  #     #
-  #     # If set, join requests with JoinEUIs matching any prefix will be rejected.
-  #     # Deny takes precedence over allow.
-  #     join_eui_deny=[]
+  #   # JoinEUI deny list.
+  #   #
+  #   # If set, join requests with JoinEUIs matching any prefix will be rejected.
+  #   # Deny takes precedence over allow.
+  #   join_eui_deny=[]
+
+  #   # Input name allow / deny lists.
+  #   #
+  #   # Filter uplinks by the "name" of the input they arrived on. Same
+  #   # allow/deny logic as the other filters: deny takes precedence, and a
+  #   # non-empty allow list restricts forwarding to matching input names.
+  #   # Unnamed inputs pass a deny-only config but are rejected when an
+  #   # allow list is set.
+  #   #
+  #   # Example:
+  #   # input_name_allow=["helium"]
+  #   # input_name_deny=["openlns", "zzzztest"]
+  #   input_name_allow=[]
+  #   input_name_deny=[]
   {{#each gwmp.output}}
   [[gwmp.output]]
+    name="{{this.name}}"
     server="{{this.server}}"
     uplink_only={{this.uplink_only}}
     relay_gateway_id_prefix="{{this.relay_gateway_id_prefix}}"
-    gateway_id_prefixes=[
+    gateway_id_allow=[
       {{#each this.gateway_id_prefixes}}
       "{{this}}",
       {{/each}}
@@ -112,29 +141,36 @@ pub fn run(config: &Configuration) {
       "{{this}}",
       {{/each}}
     ]
-
-    [gwmp.output.filters]
-      dev_addr_prefixes=[
-        {{#each this.filters.dev_addr_prefixes}}
-        "{{this}}",
-        {{/each}}
-      ]
-      dev_addr_deny=[
-        {{#each this.filters.dev_addr_deny}}
-        "{{this}}",
-        {{/each}}
-      ]
-
-      join_eui_prefixes=[
-        {{#each this.filters.join_eui_prefixes}}
-        "{{this}}",
-        {{/each}}
-      ]
-      join_eui_deny=[
-        {{#each this.filters.join_eui_deny}}
-        "{{this}}",
-        {{/each}}
-      ]
+    dev_addr_allow=[
+      {{#each this.dev_addr_prefixes}}
+      "{{this}}",
+      {{/each}}
+    ]
+    dev_addr_deny=[
+      {{#each this.dev_addr_deny}}
+      "{{this}}",
+      {{/each}}
+    ]
+    join_eui_allow=[
+      {{#each this.join_eui_prefixes}}
+      "{{this}}",
+      {{/each}}
+    ]
+    join_eui_deny=[
+      {{#each this.join_eui_deny}}
+      "{{this}}",
+      {{/each}}
+    ]
+    input_name_allow=[
+      {{#each this.input_name_allow}}
+      "{{this}}",
+      {{/each}}
+    ]
+    input_name_deny=[
+      {{#each this.input_name_deny}}
+      "{{this}}",
+      {{/each}}
+    ]
   {{/each}}
 
 
@@ -168,7 +204,7 @@ pub fn run(config: &Configuration) {
     ca_cert="{{this.ca_cert}}"
     tls_cert="{{this.tls_cert}}"
     tls_key="{{this.tls_key}}"
-    gateway_id_prefixes=[
+    gateway_id_allow=[
       {{#each this.gateway_id_prefixes}}
       "{{this}}",
       {{/each}}
@@ -183,6 +219,7 @@ pub fn run(config: &Configuration) {
   # MQTT outputs (publish uplinks to an MQTT broker, subscribe to downlinks).
   {{#each mqtt.output}}
   [[mqtt.output]]
+    name="{{this.name}}"
     server="{{this.server}}"
     json={{this.json}}
     username="{{this.username}}"
@@ -199,7 +236,7 @@ pub fn run(config: &Configuration) {
     analyzer={{this.analyzer}}
     forward_application={{this.forward_application}}
     relay_gateway_id_prefix="{{this.relay_gateway_id_prefix}}"
-    gateway_id_prefixes=[
+    gateway_id_allow=[
       {{#each this.gateway_id_prefixes}}
       "{{this}}",
       {{/each}}
@@ -210,27 +247,36 @@ pub fn run(config: &Configuration) {
       {{/each}}
     ]
 
-    [mqtt.output.filters]
-      dev_addr_prefixes=[
-        {{#each this.filters.dev_addr_prefixes}}
-        "{{this}}",
-        {{/each}}
-      ]
-      dev_addr_deny=[
-        {{#each this.filters.dev_addr_deny}}
-        "{{this}}",
-        {{/each}}
-      ]
-      join_eui_prefixes=[
-        {{#each this.filters.join_eui_prefixes}}
-        "{{this}}",
-        {{/each}}
-      ]
-      join_eui_deny=[
-        {{#each this.filters.join_eui_deny}}
-        "{{this}}",
-        {{/each}}
-      ]
+    dev_addr_allow=[
+      {{#each this.dev_addr_prefixes}}
+      "{{this}}",
+      {{/each}}
+    ]
+    dev_addr_deny=[
+      {{#each this.dev_addr_deny}}
+      "{{this}}",
+      {{/each}}
+    ]
+    join_eui_allow=[
+      {{#each this.join_eui_prefixes}}
+      "{{this}}",
+      {{/each}}
+    ]
+    join_eui_deny=[
+      {{#each this.join_eui_deny}}
+      "{{this}}",
+      {{/each}}
+    ]
+    input_name_allow=[
+      {{#each this.input_name_allow}}
+      "{{this}}",
+      {{/each}}
+    ]
+    input_name_deny=[
+      {{#each this.input_name_deny}}
+      "{{this}}",
+      {{/each}}
+    ]
   {{/each}}
 "#;
 

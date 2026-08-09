@@ -57,6 +57,8 @@ struct State {
     client: AsyncClient,
     qos: QoS,
     json: bool,
+    /// Optional configured input/output name (shown in logs). Empty = unnamed.
+    name: String,
     server: String,
     #[allow(dead_code)]
     uplink_only: bool,
@@ -103,7 +105,7 @@ impl State {
 pub async fn setup(
     config: &config::MqttConfig,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
 ) -> Result<()> {
     // Initialize the states vector
     STATES
@@ -128,9 +130,13 @@ pub async fn setup(
 async fn setup_input(
     conf: &config::MqttInput,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
 ) -> Result<()> {
-    info!(server = %conf.server, "Setting up MQTT input");
+    if conf.name.is_empty() {
+        info!(server = %conf.server, "Setting up MQTT input");
+    } else {
+        info!(server = %conf.server, name = %conf.name, "Setting up MQTT input");
+    }
 
     let qos = parse_qos(conf.qos)?;
     let (connect_tx, connect_rx) = unbounded_channel::<()>();
@@ -149,6 +155,8 @@ async fn setup_input(
         dev_addr_deny: conf.filters.dev_addr_deny.clone(),
         join_eui_prefixes: conf.filters.join_eui_prefixes.clone(),
         join_eui_deny: conf.filters.join_eui_deny.clone(),
+        input_name_allow: conf.filters.input_name_allow.clone(),
+        input_name_deny: conf.filters.input_name_deny.clone(),
     };
     let gateway_id_filters = GatewayIdFilters {
         allow: conf.gateway_id_prefixes.clone(),
@@ -159,6 +167,7 @@ async fn setup_input(
         client,
         qos,
         json: conf.json,
+        name: conf.name.clone(),
         server: conf.server.clone(),
         uplink_only: false,
         subscribe_uplinks: true,
@@ -189,10 +198,12 @@ async fn setup_input(
     let server = conf.server.clone();
     let json = conf.json;
     let reconnect_interval = conf.reconnect_interval;
+    let input_name = conf.name.clone();
     tokio::spawn(event_loop(
         eventloop, connect_tx, downlink_tx, uplink_tx,
         reconnect_interval, server, true, json,
         filters, allow_deny_filters, gateway_id_filters,
+        input_name,
     ));
 
     Ok(())
@@ -203,7 +214,11 @@ async fn setup_output(
     conf: &config::MqttOutput,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
 ) -> Result<()> {
-    info!(server = %conf.server, analyzer = conf.analyzer, subscribe_application = conf.subscribe_application, forward_application = conf.forward_application, "Setting up MQTT output");
+    if conf.name.is_empty() {
+        info!(server = %conf.server, analyzer = conf.analyzer, subscribe_application = conf.subscribe_application, forward_application = conf.forward_application, "Setting up MQTT output");
+    } else {
+        info!(server = %conf.server, name = %conf.name, analyzer = conf.analyzer, subscribe_application = conf.subscribe_application, forward_application = conf.forward_application, "Setting up MQTT output");
+    }
 
     let qos = parse_qos(conf.qos)?;
     let (connect_tx, connect_rx) = unbounded_channel::<()>();
@@ -222,6 +237,8 @@ async fn setup_output(
         dev_addr_deny: conf.filters.dev_addr_deny.clone(),
         join_eui_prefixes: conf.filters.join_eui_prefixes.clone(),
         join_eui_deny: conf.filters.join_eui_deny.clone(),
+        input_name_allow: conf.filters.input_name_allow.clone(),
+        input_name_deny: conf.filters.input_name_deny.clone(),
     };
     let gateway_id_filters = GatewayIdFilters {
         allow: conf.gateway_id_prefixes.clone(),
@@ -255,6 +272,7 @@ async fn setup_output(
         client,
         qos,
         json: conf.json,
+        name: conf.name.clone(),
         server: conf.server.clone(),
         uplink_only: conf.uplink_only,
         subscribe_uplinks: false,
@@ -287,7 +305,7 @@ async fn setup_output(
 
     // Outputs don't produce uplinks, but event_loop still needs the channel types.
     // We create a dummy uplink_tx that is never read.
-    let (dummy_uplink_tx, _) = unbounded_channel::<(GatewayId, Vec<u8>, String, Option<String>)>();
+    let (dummy_uplink_tx, _) = unbounded_channel::<(GatewayId, Vec<u8>, String, Option<String>, String)>();
     let server = conf.server.clone();
     let json = conf.json;
     let reconnect_interval = conf.reconnect_interval;
@@ -295,6 +313,7 @@ async fn setup_output(
         eventloop, connect_tx, downlink_tx, dummy_uplink_tx,
         reconnect_interval, server, false, json,
         filters, allow_deny_filters, gateway_id_filters,
+        String::new(), // outputs don't produce uplinks
     ));
 
     Ok(())
@@ -457,7 +476,7 @@ async fn event_loop(
     mut eventloop: EventLoop,
     connect_tx: tokio::sync::mpsc::UnboundedSender<()>,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     reconnect_interval: Duration,
     server: String,
     subscribe_uplinks: bool,
@@ -465,6 +484,7 @@ async fn event_loop(
     filters: lrwn_filters::Filters,
     allow_deny_filters: AllowDenyFilters,
     gateway_id_filters: GatewayIdFilters,
+    input_name: String,
 ) {
     loop {
         match eventloop.poll().await {
@@ -483,6 +503,7 @@ async fn event_loop(
                 let filters = filters.clone();
                 let allow_deny_filters = allow_deny_filters.clone();
                 let gateway_id_filters = gateway_id_filters.clone();
+                let input_name = input_name.clone();
                 tokio::spawn(async move {
                     if let Err(e) = message_callback(
                         &server,
@@ -495,6 +516,7 @@ async fn event_loop(
                         &filters,
                         &allow_deny_filters,
                         &gateway_id_filters,
+                        &input_name,
                     )
                     .await
                     {
@@ -521,12 +543,13 @@ async fn message_callback(
     original_topic: &str,
     payload: &[u8],
     downlink_tx: &UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     subscribe_uplinks: bool,
     json: bool,
     filters: &lrwn_filters::Filters,
     allow_deny_filters: &AllowDenyFilters,
     gateway_id_filters: &GatewayIdFilters,
+    input_name: &str,
 ) -> Result<()> {
     // Check if this is an application/... topic (subscribe_application)
     if original_topic.starts_with("application/") {
@@ -557,7 +580,7 @@ async fn message_callback(
             handle_downlink_message(server, gateway_id_str, payload, original_topic, downlink_tx).await
         }
         ("event", "up") if subscribe_uplinks => {
-            handle_uplink_message(server, gateway_id_str, payload, original_topic, uplink_tx, json, filters, allow_deny_filters, gateway_id_filters).await
+            handle_uplink_message(server, gateway_id_str, payload, original_topic, uplink_tx, json, filters, allow_deny_filters, gateway_id_filters, input_name).await
         }
         ("event", _) if subscribe_uplinks => {
             // Pass through other event types (stats, ack, exec, etc.) without filtering
@@ -714,11 +737,12 @@ async fn handle_uplink_message(
     gateway_id_str: &str,
     payload: &[u8],
     original_topic: &str,
-    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>)>,
+    uplink_tx: &UnboundedSender<(GatewayId, Vec<u8>, String, Option<String>, String)>,
     _json: bool,
     filters: &lrwn_filters::Filters,
     allow_deny_filters: &AllowDenyFilters,
     gateway_id_filters: &GatewayIdFilters,
+    input_name: &str,
 ) -> Result<()> {
     inc_mqtt_messages_received(server, "up").await;
 
@@ -795,12 +819,17 @@ async fn handle_uplink_message(
         (format!("mtype={}", mtype), "-".to_string())
     };
 
+    let name_prefix = if input_name.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", input_name)
+    };
     info!(
         server = %server,
         gateway_id = %gateway_id,
         dev_addr = %dev_addr_debug,
         f_port = %fport_debug,
-        "Received MQTT uplink"
+        "{}Received MQTT uplink", name_prefix,
     );
 
     // Extract region (topic_prefix) from original_topic: "{region}/gateway/..."
@@ -836,7 +865,7 @@ async fn handle_uplink_message(
             gateway_id: *gateway_id.as_bytes(),
             payload: crate::packets::PushDataPayload::new(vec![rxpk]),
         };
-        send_uplink_frame(gateway_id, &push_data_obj, &region, relay_id.as_deref()).await?;
+        send_uplink_frame(gateway_id, &push_data_obj, &region, relay_id.as_deref(), input_name).await?;
     } else {
         send_uplink_frame_direct(gateway_id, payload, original_topic, &frame.phy_payload).await?;
     }
@@ -857,7 +886,7 @@ async fn handle_uplink_message(
 
     // Send to uplink channel (for UDP servers), with relay_id for virtual gateway rewriting
     uplink_tx
-        .send((gateway_id, push_data, region, relay_id))
+        .send((gateway_id, push_data, region, relay_id, input_name.to_string()))
         .context("Uplink channel send")?;
 
     Ok(())
@@ -1002,11 +1031,16 @@ async fn send_event_passthrough(gateway_id: GatewayId, payload: &[u8], original_
             continue;
         }
 
+        let name_prefix = if state.name.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", state.name)
+        };
         info!(
             server = %state.server,
             gateway_id = %gateway_id,
             event_type = %event_type,
-            "Forwarding MQTT event"
+            "{}Forwarding MQTT event", name_prefix
         );
 
         if let Err(e) = state
@@ -1249,7 +1283,7 @@ fn code_rate_to_string(code_rate: i32) -> &'static str {
 }
 
 /// Send an uplink frame to all configured MQTT backends.
-pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, region: &str, relay_id: Option<&str>) -> Result<()> {
+pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, region: &str, relay_id: Option<&str>, input_name: &str) -> Result<()> {
     let states = match STATES.get() {
         Some(s) => s,
         None => return Ok(()), // MQTT not configured
@@ -1261,6 +1295,11 @@ pub async fn send_uplink_frame(gateway_id: GatewayId, push_data: &PushData, regi
     }
 
     for state in states.iter() {
+        // Drop uplinks from inputs this output denies by name.
+        if !state.allow_deny_filters.matches_input_name(input_name) {
+            debug!(server = %state.server, input_name = %input_name, "Dropping MQTT uplink, input name not permitted by filters");
+            continue;
+        }
         if let Err(e) = send_uplink_frame_to_backend(gateway_id, push_data, state, region, relay_id).await {
             error!(server = %state.server, error = %e, "Failed to send uplink to MQTT backend");
         }
@@ -1506,11 +1545,16 @@ async fn send_uplink_frame_direct(gateway_id: GatewayId, payload: &[u8], origina
             }
         }
 
+        let name_prefix = if state.name.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", state.name)
+        };
         info!(
             server = %state.server,
             gateway_id = %gateway_id,
             dev_addr = %dev_addr_str,
-            "Forwarding MQTT uplink"
+            "{}Forwarding MQTT uplink", name_prefix
         );
 
         if let Err(e) = state
@@ -1689,6 +1733,13 @@ async fn send_uplink_frame_to_backend(
         return Ok(());
     }
 
+    // Message prefix with the output name when configured, e.g. "[ttn] ".
+    let name_prefix = if state.name.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", state.name)
+    };
+
     // Determine effective gateway_id: apply relay prefix if configured and relay_id present
     let effective_gateway_id = if let Some(rid) = relay_id {
         if !state.relay_gateway_id_prefix.is_empty() {
@@ -1700,7 +1751,11 @@ async fn send_uplink_frame_to_backend(
                         .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
                         .unwrap_or((0, 0.0));
                     register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
-                    // Register virtual gateway in MQTT_GATEWAYS so downlinks can route back
+                    // Register virtual gateway in MQTT_GATEWAYS so downlinks can route back.
+                    // skip_pull_data=true: this runs while holding the STATES read lock, and
+                    // PULL_DATA (which acquires the SERVERS write lock) is already sent for
+                    // virtual gateways by the forwarder. Passing false here deadlocks the
+                    // service on relay uplinks (STATES-read held across a SERVERS-write wait).
                     let gw_info = {
                         let gateways = MQTT_GATEWAYS
                             .get_or_init(|| async { RwLock::new(std::collections::HashMap::new()) })
@@ -1709,14 +1764,14 @@ async fn send_uplink_frame_to_backend(
                         gateways.get(&gateway_id).map(|info| (info.server.clone(), info.region.clone(), info.last_context.clone()))
                     };
                     if let Some((server, gw_region, context)) = gw_info {
-                        register_mqtt_gateway(virtual_gw, server, gw_region, context, false).await;
+                        register_mqtt_gateway(virtual_gw, server, gw_region, context, true).await;
                     }
                     info!(
                         server = %state.server,
                         border_gateway = %gateway_id,
                         virtual_gateway = %virtual_gw,
                         relay_id = %rid,
-                        "Rewriting gateway_id for mesh relay (MQTT output)"
+                        "{}Rewriting gateway_id for mesh relay (MQTT output)", name_prefix
                     );
                     virtual_gw
                 }
@@ -1790,7 +1845,7 @@ async fn send_uplink_frame_to_backend(
         before = before_count,
         after = filtered_push_data.rxpk.len(),
         dev_addr_prefixes = state.filters.dev_addr_prefixes.len(),
-        "Applied MQTT output filters"
+        "{}Applied MQTT output filters", name_prefix
     );
 
     if filtered_push_data.rxpk.is_empty() {

@@ -12,9 +12,36 @@ pub struct AllowDenyFilters {
     pub dev_addr_deny: Vec<DevAddrPrefix>,
     pub join_eui_prefixes: Vec<EuiPrefix>,
     pub join_eui_deny: Vec<EuiPrefix>,
+    /// Input names whose uplinks are allowed by this output (allow list).
+    pub input_name_allow: Vec<String>,
+    /// Input names whose uplinks should be rejected by this output (deny list).
+    pub input_name_deny: Vec<String>,
 }
 
 impl AllowDenyFilters {
+    /// Returns true if an uplink from the given input name should pass the filter.
+    ///
+    /// Filter logic (matching the other allow/deny lists):
+    /// 1. If the deny list matches, reject.
+    /// 2. If the allow list is non-empty and doesn't match, reject.
+    /// 3. Otherwise, accept.
+    ///
+    /// An empty input name (unnamed input) is never matched by either list, so
+    /// it is rejected when an allow list is configured and passes otherwise.
+    pub fn matches_input_name(&self, input_name: &str) -> bool {
+        // Deny takes precedence.
+        if !input_name.is_empty() && self.input_name_deny.iter().any(|n| n == input_name) {
+            return false;
+        }
+
+        // Allow list, when set, restricts to matching names.
+        if !self.input_name_allow.is_empty() {
+            return self.input_name_allow.iter().any(|n| n == input_name);
+        }
+
+        true
+    }
+
     /// Returns true if the PHY payload should pass the filter.
     pub fn matches(&self, phy_payload: &[u8]) -> bool {
         // Parse the PHY payload to determine message type
@@ -172,6 +199,54 @@ mod tests {
         assert!(!filters.matches([0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]));
         // Allowed prefix, not denied should pass
         assert!(filters.matches([0x00, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01]));
+    }
+
+    #[test]
+    fn test_matches_input_name_deny() {
+        let filters = AllowDenyFilters {
+            input_name_deny: vec!["openlns".to_string(), "zzzztest".to_string()],
+            ..Default::default()
+        };
+        // Denied names are rejected.
+        assert!(!filters.matches_input_name("openlns"));
+        assert!(!filters.matches_input_name("zzzztest"));
+        // Other names pass.
+        assert!(filters.matches_input_name("chirpstack"));
+        // Unnamed inputs pass against a deny-only list.
+        assert!(filters.matches_input_name(""));
+        // Empty lists pass everything.
+        let empty = AllowDenyFilters::default();
+        assert!(empty.matches_input_name("openlns"));
+    }
+
+    #[test]
+    fn test_matches_input_name_allow() {
+        let filters = AllowDenyFilters {
+            input_name_allow: vec!["chirpstack".to_string(), "helium".to_string()],
+            ..Default::default()
+        };
+        // Only allowed names pass.
+        assert!(filters.matches_input_name("chirpstack"));
+        assert!(filters.matches_input_name("helium"));
+        // Names not in the allow list are rejected.
+        assert!(!filters.matches_input_name("openlns"));
+        // Unnamed inputs are rejected when an allow list is configured.
+        assert!(!filters.matches_input_name(""));
+    }
+
+    #[test]
+    fn test_matches_input_name_allow_and_deny() {
+        // Deny takes precedence over allow.
+        let filters = AllowDenyFilters {
+            input_name_allow: vec!["chirpstack".to_string(), "helium".to_string()],
+            input_name_deny: vec!["helium".to_string()],
+            ..Default::default()
+        };
+        assert!(filters.matches_input_name("chirpstack"));
+        // In both lists → denied.
+        assert!(!filters.matches_input_name("helium"));
+        // Not allowed → rejected.
+        assert!(!filters.matches_input_name("openlns"));
     }
 
     #[test]
