@@ -429,8 +429,19 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, 
                             let remaining_count = filtered_push_data.payload.rxpk.len();
 
                             if remaining_count == 0 {
-                                // All rxpk removed — drop.
-                                debug!("Nothing to send, UDP packet does not match filters");
+                                if filtered_push_data.payload.is_empty() {
+                                    // All rxpk removed and nothing else to send — drop.
+                                    debug!("Nothing to send, UDP packet does not match filters");
+                                } else {
+                                    // All rxpk removed, but the packet also carries gateway
+                                    // stats: these are forwarded regardless of the filters.
+                                    info!(gateway_id = %effective_gw, "{}Forwarding UDP stats (uplinks filtered)", name_prefix);
+                                    socket_entry.push_data_token = Some(random_token);
+                                    outgoing.push(OutgoingDatagram {
+                                        socket, server_name, packet_type,
+                                        data: filtered_push_data.to_bytes(),
+                                    });
+                                }
                             } else if remaining_count == original_count && !is_relay {
                                 // All rxpk passed and no relay — send original raw bytes.
                                 info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "{}Forwarding UDP uplink", name_prefix);

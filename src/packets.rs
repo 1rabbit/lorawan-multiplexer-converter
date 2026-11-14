@@ -196,25 +196,40 @@ pub struct PushDataPayload {
 #[serde(default)]
 pub struct Stat {
     /// UTC time of the gateway
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<String>,
     /// GPS latitude
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lati: Option<f64>,
     /// GPS longitude
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub long: Option<f64>,
     /// GPS altitude (meters)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub alti: Option<i32>,
     /// Number of radio packets received
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rxnb: Option<u32>,
     /// Number of radio packets received with valid CRC
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rxok: Option<u32>,
     /// Number of radio packets forwarded
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rxfw: Option<u32>,
     /// Percentage of upstream datagrams acknowledged
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ackr: Option<f64>,
     /// Number of downlink datagrams received
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dwnb: Option<u32>,
     /// Number of packets emitted
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub txnb: Option<u32>,
+
+    // Capture all the other fields (e.g. pfrm, mail, desc, temp), so that a
+    // re-serialized stat does not lose them.
+    #[serde(flatten)]
+    other: HashMap<String, serde_json::Value>,
 }
 
 impl PushDataPayload {
@@ -244,8 +259,10 @@ impl PushDataPayload {
             .collect();
     }
 
+    /// True when the payload carries nothing worth forwarding: no rxpk, no
+    /// gateway statistics and no other (unknown) top-level field.
     pub fn is_empty(&self) -> bool {
-        self.rxpk.is_empty() && self.other.is_empty()
+        self.rxpk.is_empty() && self.stat.is_none() && self.other.is_empty()
     }
 }
 
