@@ -22,6 +22,7 @@ static SERVER_UDP_RECEIVED_COUNT: OnceCell<Family<ServerUdpLabels, Counter>> =
     OnceCell::const_new();
 static MQTT_MESSAGES_PUBLISHED: OnceCell<Family<MqttLabels, Counter>> = OnceCell::const_new();
 static MQTT_MESSAGES_RECEIVED: OnceCell<Family<MqttLabels, Counter>> = OnceCell::const_new();
+static MQTT_MESSAGES_DROPPED: OnceCell<Family<MqttLabels, Counter>> = OnceCell::const_new();
 static MQTT_CONNECTED: OnceCell<Family<MqttConnectedLabels, prometheus_client::metrics::gauge::Gauge>>
     = OnceCell::const_new();
 
@@ -183,6 +184,28 @@ pub async fn inc_mqtt_messages_published(server: &str, msg_type: &str) {
             register(
                 "mqtt_messages_published_total",
                 "Number of MQTT messages published",
+                counter.clone(),
+            )
+            .await;
+            counter
+        })
+        .await;
+
+    counter
+        .get_or_create(&MqttLabels {
+            server: server.to_string(),
+            r#type: msg_type.to_string(),
+        })
+        .inc();
+}
+
+pub async fn inc_mqtt_messages_dropped(server: &str, msg_type: &str) {
+    let counter = MQTT_MESSAGES_DROPPED
+        .get_or_init(|| async {
+            let counter = Family::<MqttLabels, Counter>::default();
+            register(
+                "mqtt_messages_dropped_total",
+                "Number of MQTT messages dropped because the request queue of the broker connection was full",
                 counter.clone(),
             )
             .await;

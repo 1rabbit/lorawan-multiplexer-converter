@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{BufReader, Cursor};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -16,11 +17,29 @@ use crate::config;
 use crate::filters::{AllowDenyFilters, GatewayIdFilters};
 use crate::forwarder;
 use crate::monitoring::{
-    inc_mqtt_connected, inc_mqtt_messages_published, inc_mqtt_messages_received,
+    inc_mqtt_connected, inc_mqtt_messages_dropped, inc_mqtt_messages_published,
+    inc_mqtt_messages_received,
 };
 use crate::packets::{GatewayId, PushData, PullResp, RxPk, downlink_frame_to_pull_resp, downlink_tx_ack_to_tx_ack};
 
 static STATES: OnceCell<RwLock<Vec<State>>> = OnceCell::const_new();
+
+/// Capacity of the request queue between the multiplexer and the event loop of
+/// each MQTT connection. The queue absorbs bursts and short network stalls.
+/// It is not drained while the broker is unreachable, so once it is full new
+/// messages for that broker are dropped (see `State::publish`).
+const REQUEST_QUEUE_CAPACITY: usize = 1000;
+
+/// While a backend keeps dropping messages, log a warning for the first drop
+/// and then once every this many drops.
+const DROP_LOG_INTERVAL: u64 = 1000;
+
+/// Maximum MQTT packet size, in both directions. This is the largest packet
+/// the protocol can encode (remaining length of 268,435,455 bytes), so the
+/// broker's own limit is the only one that applies. rumqttc defaults to
+/// 10 KiB and treats a larger packet as a connection error, which made every
+/// oversized `application/#` message drop the connection to its broker.
+const MAX_PACKET_SIZE: usize = 268_435_455;
 
 /// Track which gateways connected via MQTT-in (server URL as value)
 static MQTT_GATEWAYS: OnceCell<RwLock<std::collections::HashMap<GatewayId, MqttGatewayInfo>>> = OnceCell::const_new();
@@ -75,9 +94,52 @@ struct State {
     allow_deny_filters: AllowDenyFilters,
     /// Mesh relay virtual gateway prefix (8 hex chars). Empty = disabled.
     relay_gateway_id_prefix: String,
+    /// Messages dropped since the last successfully queued one (request queue full).
+    dropped: AtomicU64,
 }
 
 impl State {
+    /// Queue a message for publishing on this backend, without ever waiting.
+    ///
+    /// The request queue is bounded and is not drained while the broker is
+    /// unreachable. Waiting for free space would stall the caller (the single
+    /// uplink forwarding task, the UDP receive loop, an MQTT message callback)
+    /// and with it every other output, so a message that does not fit is
+    /// dropped instead.
+    ///
+    /// Returns `false` when the message was dropped. The drop is logged and
+    /// counted here; callers do not need to report it again.
+    async fn publish(&self, topic: &str, payload: impl Into<Vec<u8>>, msg_type: &str) -> bool {
+        match self.client.try_publish(topic, self.qos, false, payload) {
+            Ok(()) => {
+                let dropped = self.dropped.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    info!(
+                        server = %self.server,
+                        dropped = dropped,
+                        "MQTT request queue is accepting messages again"
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                inc_mqtt_messages_dropped(&self.server, msg_type).await;
+                if dropped == 1 || dropped.is_multiple_of(DROP_LOG_INTERVAL) {
+                    warn!(
+                        server = %self.server,
+                        topic = %topic,
+                        msg_type = %msg_type,
+                        dropped = dropped,
+                        error = %e,
+                        "Dropping MQTT message, request queue is full (broker unreachable or too slow)"
+                    );
+                }
+                false
+            }
+        }
+    }
+
     fn match_gateway_id(&self, gateway_id: GatewayId) -> bool {
         let gw_id_le = gateway_id.as_bytes_le();
 
@@ -178,6 +240,7 @@ async fn setup_input(
         filters: filters.clone(),
         allow_deny_filters: allow_deny_filters.clone(),
         relay_gateway_id_prefix: String::new(), // Inputs don't do relay rewriting
+        dropped: AtomicU64::new(0),
     };
 
     {
@@ -283,6 +346,7 @@ async fn setup_output(
         filters: filters.clone(),
         allow_deny_filters: allow_deny_filters.clone(),
         relay_gateway_id_prefix: relay_prefix,
+        dropped: AtomicU64::new(0),
     };
 
     {
@@ -352,6 +416,7 @@ fn create_mqtt_client(
     let mut mqtt_options = MqttOptions::new(&cid, host, port);
     mqtt_options.set_keep_alive(keep_alive);
     mqtt_options.set_clean_session(clean_session);
+    mqtt_options.set_max_packet_size(MAX_PACKET_SIZE, MAX_PACKET_SIZE);
 
     if !username.is_empty() {
         mqtt_options.set_credentials(username, password);
@@ -367,7 +432,7 @@ fn create_mqtt_client(
         mqtt_options.set_transport(Transport::Ws);
     }
 
-    Ok(AsyncClient::new(mqtt_options, 100))
+    Ok(AsyncClient::new(mqtt_options, REQUEST_QUEUE_CAPACITY))
 }
 
 pub fn build_tls_config(ca_cert: &str, tls_cert: &str, tls_key: &str) -> Result<rustls::ClientConfig> {
@@ -686,15 +751,9 @@ async fn publish_command_to_analyzer_backends(
             "Publishing downlink command to analyzer backend"
         );
 
-        if let Err(e) = state
-            .client
-            .publish(original_topic, state.qos, false, original_payload)
-            .await
-        {
-            error!(server = %state.server, error = %e, "Failed to publish downlink command");
+        if state.publish(original_topic, original_payload, "down").await {
+            inc_mqtt_messages_published(&state.server, "down").await;
         }
-
-        inc_mqtt_messages_published(&state.server, "down").await;
     }
 }
 
@@ -726,9 +785,7 @@ async fn handle_application_message(origin_server: &str, topic: &str, payload: &
             "Forwarding application message to forward_application backend"
         );
 
-        if let Err(e) = state.client.publish(topic, state.qos, false, payload).await {
-            error!(server = %state.server, error = %e, "Failed to publish application message");
-        }
+        state.publish(topic, payload, "application").await;
     }
 }
 
@@ -1043,13 +1100,7 @@ async fn send_event_passthrough(gateway_id: GatewayId, payload: &[u8], original_
             "{}Forwarding MQTT event", name_prefix
         );
 
-        if let Err(e) = state
-            .client
-            .publish(original_topic, state.qos, false, payload)
-            .await
-        {
-            error!(server = %state.server, error = %e, "Failed to publish MQTT event");
-        }
+        state.publish(original_topic, payload, "event").await;
     }
 
     Ok(())
@@ -1557,13 +1608,7 @@ async fn send_uplink_frame_direct(gateway_id: GatewayId, payload: &[u8], origina
             "{}Forwarding MQTT uplink", name_prefix
         );
 
-        if let Err(e) = state
-            .client
-            .publish(original_topic, state.qos, false, payload)
-            .await
-        {
-            error!(server = %state.server, error = %e, "Failed to publish MQTT uplink");
-        }
+        state.publish(original_topic, payload, "up").await;
     }
 
     Ok(())
@@ -1620,11 +1665,9 @@ async fn send_downlink_frame_direct(gateway_id: GatewayId, payload: &[u8], topic
                 );
             }
 
-            state
-                .client
-                .publish(&effective_topic, state.qos, false, payload)
-                .await
-                .context("MQTT publish downlink")?;
+            if !state.publish(&effective_topic, payload, "down").await {
+                return Err(anyhow!("MQTT downlink for gateway {} was dropped", route_gw));
+            }
 
             return Ok(());
         }
@@ -1706,11 +1749,9 @@ pub async fn send_downlink_frame(gateway_id: GatewayId, data: &[u8]) -> Result<(
                 "Sending MQTT downlink"
             );
 
-            state
-                .client
-                .publish(&topic, state.qos, false, payload)
-                .await
-                .context("MQTT publish downlink")?;
+            if !state.publish(&topic, payload, "down").await {
+                return Err(anyhow!("MQTT downlink for gateway {} was dropped", gateway_id));
+            }
 
             return Ok(());
         }
@@ -1881,11 +1922,11 @@ async fn send_uplink_frame_to_backend(
         };
 
         trace!(server = %state.server, topic = %topic, "Publishing MQTT uplink");
-        state
-            .client
-            .publish(&topic, state.qos, false, payload)
-            .await
-            .context("MQTT publish")?;
+        if !state.publish(&topic, payload, "up").await {
+            // Already logged and counted. The queue is full, so the remaining
+            // frames of this packet would be dropped as well.
+            return Ok(());
+        }
 
         inc_mqtt_messages_published(&state.server, "up").await;
     }
@@ -1951,15 +1992,9 @@ pub async fn send_tx_ack(gateway_id: GatewayId, tx_ack: &gw::DownlinkTxAck, regi
             "Publishing MQTT DownlinkTxAck"
         );
 
-        if let Err(e) = state
-            .client
-            .publish(&topic, state.qos, false, payload)
-            .await
-        {
-            error!(server = %state.server, error = %e, "Failed to publish MQTT TxAck");
+        if state.publish(&topic, payload, "ack").await {
+            inc_mqtt_messages_published(&state.server, "ack").await;
         }
-
-        inc_mqtt_messages_published(&state.server, "ack").await;
     }
 
     Ok(())
@@ -2004,15 +2039,9 @@ pub async fn send_gateway_stats(gateway_id: GatewayId, stats: &gw::GatewayStats,
             "Publishing MQTT GatewayStats"
         );
 
-        if let Err(e) = state
-            .client
-            .publish(&topic, state.qos, false, payload)
-            .await
-        {
-            error!(server = %state.server, error = %e, "Failed to publish MQTT stats");
+        if state.publish(&topic, payload, "stats").await {
+            inc_mqtt_messages_published(&state.server, "stats").await;
         }
-
-        inc_mqtt_messages_published(&state.server, "stats").await;
     }
 
     Ok(())
